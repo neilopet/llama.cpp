@@ -131,6 +131,10 @@ if (Vulkan_FOUND)
         add_compile_definitions(GGML_VULKAN_RUN_TESTS)
     endif()
 
+    if (GGML_VULKAN_SPARSE_TESTING)
+        add_compile_definitions(GGML_VULKAN_SPARSE_TESTING)
+    endif()
+
     # Set up toolchain for host compilation whether cross-compiling or not
     if (CMAKE_CROSSCOMPILING)
         if (GGML_VULKAN_SHADERS_GEN_TOOLCHAIN)
