@@ -250,6 +250,16 @@ ggml_metal_library_t ggml_metal_library_init(ggml_metal_device_t dev) {
                     // TODO: context-adaptive dispatch — compile both 4-mag and 8-LUT
                     // FA kernel instantiations, select based on ne11 (KV cache size)
                     // at dispatch time in ggml_metal_op_flash_attn_ext()
+
+                    // Alpha scaling for turbo dequant norms.
+                    // Q4_K_M models benefit from TURBO_ALPHA=102 (1.02x, 10-17% KLD improvement).
+                    // Default: 100 (1.00x, no scaling).
+                    // Motivated by spiritbuun's TCQ adaptive alpha research.
+                    const char * alpha_env = getenv("TURBO_ALPHA");
+                    if (alpha_env) {
+                        [prep setObject:[NSString stringWithUTF8String:alpha_env] forKey:@"TURBO_ALPHA_X100"];
+                        GGML_LOG_INFO("%s: turbo alpha scaling = %s/100 (TURBO_ALPHA=%s)\n", __func__, alpha_env, alpha_env);
+                    }
                 }
 
                 // TurboQuant profiling: set TURBO_PROFILE_MODE env var (0-4)

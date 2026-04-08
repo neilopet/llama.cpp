@@ -30,6 +30,20 @@ GGML_API int turbo3_cpu_wht_group_size = 0;
 #define TURBO_D             128  /* rotation group size = head_dim (independent of block size) */
 #define TURBO_QJL_CONST     1.2533141373155003f  /* sqrt(pi/2) */
 
+/* Alpha scaling for dequant norms. Set via TURBO_ALPHA env var (integer, default 100).
+ * Q4_K_M models benefit from alpha=1.02 (TURBO_ALPHA=102). */
+GGML_API float turbo_alpha_scale = 1.0f;
+
+void turbo_init_alpha(void) {
+    const char * env = getenv("TURBO_ALPHA");
+    if (env) {
+        int val = atoi(env);
+        if (val > 0 && val < 200) {
+            turbo_alpha_scale = (float)val / 100.0f;
+        }
+    }
+}
+
 /* Optimal centroids from paper (scaled by 1/sqrt(d)) */
 /* 2-bit: {±0.453, ±1.51} / sqrt(d) */
 static const float CENTROIDS_2BIT[4] = { -0.133462f, -0.039994f, 0.039994f, 0.133462f };
@@ -307,7 +321,7 @@ void dequantize_row_turbo3_0(const block_turbo3_0 * GGML_RESTRICT x, float * GGM
     assert(k % QK_TURBO3 == 0);
     const int nb = k / QK_TURBO3;
     for (int block = 0; block < nb; block++) {
-        float norm = GGML_FP16_TO_FP32(x[block].norm);
+        float norm = GGML_FP16_TO_FP32(x[block].norm) * turbo_alpha_scale;
         for (int j = 0; j < QK_TURBO3; j++) {
             uint8_t low2 = (x[block].qs[j/4] >> ((j%4)*2)) & 0x3;
             uint8_t hi1 = (x[block].signs[j/8] >> (j%8)) & 0x1;
@@ -424,7 +438,7 @@ size_t quantize_turbo2_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT d
 /* ---------- TURBO4_0: 3-bit PolarQuant + 1-bit QJL ---------- */
 
 void quantize_row_turbo4_0_ref(const float * GGML_RESTRICT x, block_turbo4_0 * GGML_RESTRICT y, int64_t k) {
-    turbo_init_rotation();
+    turbo_init_rotation(); turbo_init_alpha();
     turbo_init_qjl();
 
     assert(k % QK_TURBO4 == 0);
@@ -535,7 +549,7 @@ void quantize_row_turbo4_0_ref(const float * GGML_RESTRICT x, block_turbo4_0 * G
 }
 
 void dequantize_row_turbo4_0(const block_turbo4_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
-    turbo_init_rotation();
+    turbo_init_rotation(); turbo_init_alpha();
 
     assert(k % QK_TURBO4 == 0);
     const int nb = k / QK_TURBO4;

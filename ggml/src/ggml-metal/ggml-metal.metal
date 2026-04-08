@@ -441,6 +441,17 @@ static void turbo_rotate_inverse(thread float * x, constant float * s1, constant
 
 // 2-bit centroids for d=128 (scaled by 1/sqrt(128))
 constant float turbo_centroids_2bit[4] = { -0.133462f, -0.039994f, 0.039994f, 0.133462f };
+
+// Alpha scaling for turbo dequant norms.
+// TURBO_ALPHA_X100 is set via TURBO_ALPHA env var (default 100 = 1.00x).
+// Q4_K_M models benefit from alpha=1.02 (10-17% KLD improvement).
+// Motivated by spiritbuun's adaptive alpha scaling in TCQ.
+// See: https://huggingface.co/datasets/spiritbuun/turboquant-tcq-kv-cache
+#ifndef TURBO_ALPHA_X100
+#define TURBO_ALPHA_X100 100
+#endif
+constant float turbo_alpha_scale = float(TURBO_ALPHA_X100) / 100.0f;
+
 // 3-bit centroids for d=128
 constant float turbo_centroids_3bit[8] = {
     -0.190685f, -0.117832f, -0.065717f, -0.021460f,
@@ -681,7 +692,7 @@ void dequantize_turbo2_0_t4(device const block_turbo2_0 * xb, short il, thread t
 // Non-vec: 16 elements per call (il ∈ {0,1}), returns type4x4
 template <typename type4x4>
 void dequantize_turbo3_0(device const block_turbo3_0 * xb, short il, thread type4x4 & reg) {
-    const float norm = float(xb->norm);
+    const float norm = float(xb->norm) * turbo_alpha_scale;
     // il=0 → elements 0-15 (qs bytes 0-3, signs bytes 0-1)
     // il=1 → elements 16-31 (qs bytes 4-7, signs bytes 2-3)
     const int qs_off = il * 4;
@@ -749,11 +760,11 @@ void dequantize_turbo3_0_t4(device const block_turbo3_0 * xb, short il, thread t
     reg = type4(0.0f);
 #elif TURBO_PROFILE_MODE == 2
     // NORM ONLY: just read norm, return it as all 4 values
-    const float norm = float(xb->norm);
+    const float norm = float(xb->norm) * turbo_alpha_scale;
     reg = type4(norm);
 #elif TURBO_PROFILE_MODE == 3
     // NORM + QS: read norm and qs byte, skip signs
-    const float norm = float(xb->norm);
+    const float norm = float(xb->norm) * turbo_alpha_scale;
     const uint8_t qb = xb->qs[il];
     const uint8_t q0 = (qb      ) & 0x03;
     const uint8_t q1 = (qb >> 2) & 0x03;
@@ -768,7 +779,7 @@ void dequantize_turbo3_0_t4(device const block_turbo3_0 * xb, short il, thread t
     ) * norm);
 #elif TURBO_PROFILE_MODE == 4
     // SKIP LUT: read all bytes but use constant centroid value
-    const float norm = float(xb->norm);
+    const float norm = float(xb->norm) * turbo_alpha_scale;
     const uint8_t qb = xb->qs[il];
     const uint8_t sb = xb->signs[il >> 1];
     // Pretend all elements are centroid 0 — isolates LUT indexing cost
@@ -778,7 +789,7 @@ void dequantize_turbo3_0_t4(device const block_turbo3_0 * xb, short il, thread t
     // Only 4 possible constant addresses per lookup (vs 8 in full LUT).
     // Sign applied via select() — no branch, just conditional negate.
     // Correct sign mapping: sign=1 → +mag[qs], sign=0 → -mag[3-qs] (reversed)
-    const float norm = float(xb->norm);
+    const float norm = float(xb->norm) * turbo_alpha_scale;
     const uint8_t qb = xb->qs[il];
     const uint8_t sb = xb->signs[il >> 1];
     const int sshift = (il & 1) << 2;
@@ -829,7 +840,7 @@ void dequantize_turbo3_0_t4(device const block_turbo3_0 * xb, short il, thread t
 // ----- turbo4 dequantize with per-thread block cache -----
 
 static void turbo4_dequantize_full_block(device const block_turbo4_0 * xb, thread float * cache) {
-    const float norm = float(xb->norm);
+    const float norm = float(xb->norm) * turbo_alpha_scale;
 
     // 4-bit nibble unpack — 2 elements per byte, simple and fast
     for (int j = 0; j < 128; j++) {
