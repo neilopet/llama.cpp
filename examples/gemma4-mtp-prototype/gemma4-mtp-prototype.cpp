@@ -835,9 +835,11 @@ struct oracle_fixture {
         int input_token = -1;
         int expected_top_token = -1;
         std::vector<float> activations;
+        std::vector<uint8_t> mask;
         std::vector<float> expected_logits;
         std::vector<float> expected_hidden;
         std::vector<float> expected_final_hidden;
+        std::vector<mtp_layer_trace> expected_layers;
     };
 
     int draft_input_pos = 0;
@@ -914,9 +916,25 @@ static oracle_fixture load_mtp_oracle_fixture(const fs::path & dir) {
             out.input_token = step.at("input_token").get<int>();
             out.expected_top_token = step.at("expected_top_token").get<int>();
             out.activations = read_f32_file(dir / step.at("activations").at("file").get<std::string>());
+            if (step.contains("mask")) {
+                out.mask = read_u8_file(dir / step.at("mask").at("file").get<std::string>());
+            }
             out.expected_logits = read_f32_file(dir / step.at("expected_logits").at("file").get<std::string>());
             out.expected_hidden = read_f32_file(dir / step.at("expected_hidden").at("file").get<std::string>());
             out.expected_final_hidden = read_f32_file(dir / step.at("expected_final_hidden").at("file").get<std::string>());
+            if (step.contains("layers")) {
+                for (const auto & layer : step.at("layers")) {
+                    mtp_layer_trace layer_out;
+                    layer_out.hidden_in = read_f32_file(dir / layer.at("hidden_in").at("file").get<std::string>());
+                    layer_out.q_rope = read_f32_file(dir / layer.at("q_rope").at("file").get<std::string>());
+                    layer_out.attn = read_f32_file(dir / layer.at("attn").at("file").get<std::string>());
+                    layer_out.post_norm = read_f32_file(dir / layer.at("post_norm").at("file").get<std::string>());
+                    layer_out.hidden_after_attn = read_f32_file(dir / layer.at("hidden_after_attn").at("file").get<std::string>());
+                    layer_out.ff_out_norm = read_f32_file(dir / layer.at("ff_out_norm").at("file").get<std::string>());
+                    layer_out.hidden_after_ff = read_f32_file(dir / layer.at("hidden_after_ff").at("file").get<std::string>());
+                    out.expected_layers.push_back(std::move(layer_out));
+                }
+            }
             fx.chain.push_back(std::move(out));
         }
     }
@@ -1697,6 +1715,9 @@ int main(int argc, char ** argv) {
                 step_fx.active_len = step.active_len;
                 step_fx.good_token = step.input_token;
                 step_fx.activations = step.activations;
+                if (!step.mask.empty()) {
+                    step_fx.mask = step.mask;
+                }
                 auto got = run_mtp_step_padded_traced(*mtp, step_fx);
                 chain_reports.push_back({
                     {"step_index", step.step_index},
@@ -1709,6 +1730,32 @@ int main(int argc, char ** argv) {
                     {"logits", compare_vec(step.expected_logits, got.logits)},
                     {"hidden", compare_vec(step.expected_hidden, got.hidden)},
                     {"final_hidden", compare_vec(step.expected_final_hidden, got.final_hidden)},
+                    {"layers", [&]() {
+                        json layer_reports = json::array();
+                        if (step.expected_layers.size() != got.layers.size()) {
+                            layer_reports.push_back({
+                                {"size_mismatch", true},
+                                {"expected_layers", step.expected_layers.size()},
+                                {"actual_layers", got.layers.size()},
+                            });
+                            return layer_reports;
+                        }
+                        for (size_t i = 0; i < step.expected_layers.size(); ++i) {
+                            const auto & exp = step.expected_layers.at(i);
+                            const auto & act = got.layers.at(i);
+                            layer_reports.push_back({
+                                {"layer_index", i},
+                                {"hidden_in", compare_vec(exp.hidden_in, act.hidden_in)},
+                                {"q_rope", compare_vec(exp.q_rope, act.q_rope)},
+                                {"attn", compare_vec(exp.attn, act.attn)},
+                                {"post_norm", compare_vec(exp.post_norm, act.post_norm)},
+                                {"hidden_after_attn", compare_vec(exp.hidden_after_attn, act.hidden_after_attn)},
+                                {"ff_out_norm", compare_vec(exp.ff_out_norm, act.ff_out_norm)},
+                                {"hidden_after_ff", compare_vec(exp.hidden_after_ff, act.hidden_after_ff)},
+                            });
+                        }
+                        return layer_reports;
+                    }()},
                 });
             }
             json report = {
