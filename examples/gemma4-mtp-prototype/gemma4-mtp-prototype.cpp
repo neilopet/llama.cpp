@@ -812,6 +812,8 @@ struct proto_metrics {
 struct mtp_layer_trace {
     std::vector<float> hidden_in;
     std::vector<float> q_rope;
+    std::vector<float> scores;
+    std::vector<float> probs;
     std::vector<float> attn;
     std::vector<float> post_norm;
     std::vector<float> hidden_after_attn;
@@ -828,6 +830,14 @@ struct mtp_trace_output {
 };
 
 struct oracle_fixture {
+    struct base_step {
+        int step_index = 0;
+        int consumed_token = -1;
+        int expected_top_token = -1;
+        std::vector<float> expected_logits;
+        std::vector<float> expected_hidden;
+    };
+
     struct chain_step {
         int step_index = 0;
         int input_pos = 0;
@@ -842,6 +852,9 @@ struct oracle_fixture {
         std::vector<mtp_layer_trace> expected_layers;
     };
 
+    std::vector<uint32_t> prompt_token_ids;
+    std::vector<float> pre_mtp_hidden;
+    std::vector<float> pre_mtp_logits;
     int draft_input_pos = 0;
     int active_len = 0;
     int max_seq_len = 0;
@@ -853,6 +866,7 @@ struct oracle_fixture {
     std::vector<int8_t> v13;
     std::vector<int8_t> v14;
     mtp_trace_output expected;
+    std::vector<base_step> base_chain;
     std::vector<chain_step> chain;
 };
 
@@ -882,6 +896,13 @@ static oracle_fixture load_mtp_oracle_fixture(const fs::path & dir) {
         throw std::runtime_error("unexpected oracle fixture format");
     }
     oracle_fixture fx;
+    if (cfg.contains("prompt_token_ids")) {
+        for (const auto & tok : cfg.at("prompt_token_ids")) {
+            fx.prompt_token_ids.push_back(tok.get<uint32_t>());
+        }
+    }
+    fx.pre_mtp_hidden = read_f32_file(dir / cfg.at("pre_mtp_hidden").at("file").get<std::string>());
+    fx.pre_mtp_logits = read_f32_file(dir / cfg.at("pre_mtp_logits").at("file").get<std::string>());
     fx.draft_input_pos = cfg.at("draft_input_pos").get<int>();
     fx.active_len = cfg.at("active_len").get<int>();
     fx.max_seq_len = cfg.at("max_seq_len").get<int>();
@@ -896,10 +917,23 @@ static oracle_fixture load_mtp_oracle_fixture(const fs::path & dir) {
     fx.expected.hidden = read_f32_file(dir / cfg.at("expected").at("hidden").at("file").get<std::string>());
     fx.expected.final_hidden = read_f32_file(dir / cfg.at("expected").at("final_hidden").at("file").get<std::string>());
     fx.expected.token = cfg.at("expected").at("top_token").get<int>();
+    if (cfg.contains("base_chain") && cfg.at("base_chain").contains("teacher_forced_steps")) {
+        for (const auto & step : cfg.at("base_chain").at("teacher_forced_steps")) {
+            oracle_fixture::base_step out;
+            out.step_index = step.at("step_index").get<int>();
+            out.consumed_token = step.at("consumed_token").get<int>();
+            out.expected_top_token = step.at("expected_top_token").get<int>();
+            out.expected_logits = read_f32_file(dir / step.at("expected_logits").at("file").get<std::string>());
+            out.expected_hidden = read_f32_file(dir / step.at("expected_hidden").at("file").get<std::string>());
+            fx.base_chain.push_back(std::move(out));
+        }
+    }
     for (const auto & layer : cfg.at("trace").at("layers")) {
         mtp_layer_trace out;
         out.hidden_in = read_f32_file(dir / layer.at("hidden_in").at("file").get<std::string>());
         out.q_rope = read_f32_file(dir / layer.at("q_rope").at("file").get<std::string>());
+        out.scores = read_f32_file(dir / layer.at("scores").at("file").get<std::string>());
+        out.probs = read_f32_file(dir / layer.at("probs").at("file").get<std::string>());
         out.attn = read_f32_file(dir / layer.at("attn").at("file").get<std::string>());
         out.post_norm = read_f32_file(dir / layer.at("post_norm").at("file").get<std::string>());
         out.hidden_after_attn = read_f32_file(dir / layer.at("hidden_after_attn").at("file").get<std::string>());
@@ -927,6 +961,8 @@ static oracle_fixture load_mtp_oracle_fixture(const fs::path & dir) {
                     mtp_layer_trace layer_out;
                     layer_out.hidden_in = read_f32_file(dir / layer.at("hidden_in").at("file").get<std::string>());
                     layer_out.q_rope = read_f32_file(dir / layer.at("q_rope").at("file").get<std::string>());
+                    layer_out.scores = read_f32_file(dir / layer.at("scores").at("file").get<std::string>());
+                    layer_out.probs = read_f32_file(dir / layer.at("probs").at("file").get<std::string>());
                     layer_out.attn = read_f32_file(dir / layer.at("attn").at("file").get<std::string>());
                     layer_out.post_norm = read_f32_file(dir / layer.at("post_norm").at("file").get<std::string>());
                     layer_out.hidden_after_attn = read_f32_file(dir / layer.at("hidden_after_attn").at("file").get<std::string>());
@@ -1116,6 +1152,8 @@ static mtp_trace_output run_mtp_step_unpadded_traced(const mtp_sidecar & sc, int
         auto scores = runtime_bmm_qk_seq_major(q, layer.heads, layer.head_dim, k_cache, active_len, k_scale);
         auto probs = masked_softmax_rows_prefix(scores, layer.heads, active_len);
         auto attn = runtime_bmm_v_dim_major(probs, layer.heads, active_len, v_cache, layer.head_dim, v_scale);
+        layer_trace.scores = scores;
+        layer_trace.probs = probs;
         layer_trace.attn = attn;
         auto post = layer.o_proj.run(attn);
         post = rms_norm_last_dim(post, layer.post_attn_norm_weight, MTP_EPS);
@@ -1170,6 +1208,8 @@ static mtp_trace_output run_mtp_step_padded_traced(const mtp_sidecar & sc, const
         auto scores = runtime_bmm_qk_seq_major_padded(q, layer.heads, layer.head_dim, k_cache, fx.active_len, fx.max_seq_len, k_scale);
         auto probs = masked_softmax_rows_mask(scores, layer.heads, fx.max_seq_len, fx.mask);
         auto attn = runtime_bmm_v_padded(probs, layer.heads, fx.max_seq_len, v_cache, layer.head_dim, fx.active_len, v_scale);
+        layer_trace.scores = scores;
+        layer_trace.probs = probs;
         layer_trace.attn = attn;
         auto post = layer.o_proj.run(attn);
         post = rms_norm_last_dim(post, layer.post_attn_norm_weight, MTP_EPS);
@@ -1594,12 +1634,60 @@ static json run_step_compare(
     };
 }
 
+static json run_live_base_compare(
+        llama_context * ctx_dft,
+        const oracle_fixture & fx,
+        const llama_vocab * vocab) {
+    const float * start_logits = llama_get_logits_ith(ctx_dft, -1);
+    const float * start_hidden = llama_get_embeddings_ith(ctx_dft, -1);
+    if (!start_logits || !start_hidden) {
+        throw std::runtime_error("draft logits/hidden unavailable for base compare");
+    }
+
+    const int n_vocab = llama_vocab_n_tokens(vocab);
+    json steps = json::array();
+    int n_past = (int) fx.prompt_token_ids.size();
+
+    steps.push_back({
+        {"step_index", 0},
+        {"mode", "prefill_tail"},
+        {"expected_top_token", argmax_logits(fx.pre_mtp_logits.data(), (int) fx.pre_mtp_logits.size())},
+        {"actual_top_token", argmax_logits_skip_eog(vocab, start_logits, n_vocab)},
+        {"logits", compare_vec(fx.pre_mtp_logits, std::vector<float>(start_logits, start_logits + fx.pre_mtp_logits.size()))},
+        {"hidden", compare_vec(fx.pre_mtp_hidden, std::vector<float>(start_hidden, start_hidden + fx.pre_mtp_hidden.size()))},
+    });
+
+    for (const auto & step : fx.base_chain) {
+        decode_tokens(ctx_dft, { (llama_token) step.consumed_token }, n_past, true);
+        const float * got_logits = llama_get_logits_ith(ctx_dft, -1);
+        const float * got_hidden = llama_get_embeddings_ith(ctx_dft, -1);
+        if (!got_logits || !got_hidden) {
+            throw std::runtime_error("draft logits/hidden unavailable during base compare");
+        }
+        steps.push_back({
+            {"step_index", step.step_index},
+            {"consumed_token", step.consumed_token},
+            {"expected_top_token", step.expected_top_token},
+            {"actual_top_token", argmax_logits_skip_eog(vocab, got_logits, n_vocab)},
+            {"top1_match", step.expected_top_token == argmax_logits_skip_eog(vocab, got_logits, n_vocab)},
+            {"logits", compare_vec(step.expected_logits, std::vector<float>(got_logits, got_logits + step.expected_logits.size()))},
+            {"hidden", compare_vec(step.expected_hidden, std::vector<float>(got_hidden, got_hidden + step.expected_hidden.size()))},
+        });
+    }
+
+    return {
+        {"mode", "live_base_compare"},
+        {"steps", steps},
+    };
+}
+
 static std::vector<std::string> strip_custom_args(
         int argc,
         char ** argv,
         std::optional<std::string> & sidecar_dir,
         std::optional<std::string> & fixture_dir,
         std::optional<int> & step_compare,
+        bool & base_compare,
         std::optional<std::string> & report_path,
         bool & draft_only) {
     std::vector<std::string> out;
@@ -1628,6 +1716,10 @@ static std::vector<std::string> strip_custom_args(
             step_compare = std::stoi(argv[++i]);
             continue;
         }
+        if (arg == "--gemma4-mtp-base-compare") {
+            base_compare = true;
+            continue;
+        }
         if (arg == "--gemma4-mtp-draft-only") {
             draft_only = true;
             continue;
@@ -1651,9 +1743,10 @@ int main(int argc, char ** argv) {
         std::optional<std::string> sidecar_dir;
         std::optional<std::string> fixture_dir;
         std::optional<int> step_compare;
+        bool base_compare = false;
         std::optional<std::string> report_path;
         bool draft_only = false;
-        std::vector<std::string> stripped = strip_custom_args(argc, argv, sidecar_dir, fixture_dir, step_compare, report_path, draft_only);
+        std::vector<std::string> stripped = strip_custom_args(argc, argv, sidecar_dir, fixture_dir, step_compare, base_compare, report_path, draft_only);
         std::vector<char *> argv2;
         argv2.reserve(stripped.size());
         for (auto & s : stripped) {
@@ -1663,7 +1756,7 @@ int main(int argc, char ** argv) {
         argv = argv2.data();
 
         const bool use_mtp = sidecar_dir.has_value();
-        const bool offline_fixture = fixture_dir.has_value();
+        const bool offline_fixture = fixture_dir.has_value() && !base_compare;
         proto_metrics metrics;
         metrics.draft_only = draft_only;
         metrics.use_mtp = use_mtp;
@@ -1696,6 +1789,10 @@ int main(int argc, char ** argv) {
                     {"hidden_in_padded", compare_vec(exp.hidden_in, pad.hidden_in)},
                     {"q_rope_unpadded", compare_vec(exp.q_rope, unp.q_rope)},
                     {"q_rope_padded", compare_vec(exp.q_rope, pad.q_rope)},
+                    {"scores_unpadded", compare_vec(exp.scores, unp.scores)},
+                    {"scores_padded", compare_vec(exp.scores, pad.scores)},
+                    {"probs_unpadded", compare_vec(exp.probs, unp.probs)},
+                    {"probs_padded", compare_vec(exp.probs, pad.probs)},
                     {"attn_unpadded", compare_vec(exp.attn, unp.attn)},
                     {"attn_padded", compare_vec(exp.attn, pad.attn)},
                     {"post_norm_unpadded", compare_vec(exp.post_norm, unp.post_norm)},
@@ -1747,6 +1844,8 @@ int main(int argc, char ** argv) {
                                 {"layer_index", i},
                                 {"hidden_in", compare_vec(exp.hidden_in, act.hidden_in)},
                                 {"q_rope", compare_vec(exp.q_rope, act.q_rope)},
+                                {"scores", compare_vec(exp.scores, act.scores)},
+                                {"probs", compare_vec(exp.probs, act.probs)},
                                 {"attn", compare_vec(exp.attn, act.attn)},
                                 {"post_norm", compare_vec(exp.post_norm, act.post_norm)},
                                 {"hidden_after_attn", compare_vec(exp.hidden_after_attn, act.hidden_after_attn)},
@@ -1846,7 +1945,20 @@ int main(int argc, char ** argv) {
             return 1;
         }
 
-        std::vector<llama_token> prompt = common_tokenize(ctx_dft, params.prompt, true, true);
+        std::optional<oracle_fixture> live_fixture;
+        std::vector<llama_token> prompt;
+        if (base_compare) {
+            if (!fixture_dir) {
+                throw std::runtime_error("--gemma4-mtp-base-compare requires --gemma4-mtp-fixture");
+            }
+            live_fixture.emplace(load_mtp_oracle_fixture(*fixture_dir));
+            prompt.reserve(live_fixture->prompt_token_ids.size());
+            for (uint32_t tok : live_fixture->prompt_token_ids) {
+                prompt.push_back((llama_token) tok);
+            }
+        } else {
+            prompt = common_tokenize(ctx_dft, params.prompt, true, true);
+        }
         if ((draft_only ? 0 : ((int) prompt.size() > (int) llama_n_ctx(ctx_tgt))) || (int) prompt.size() > (int) llama_n_ctx(ctx_dft)) {
             LOG_ERR("%s: prompt too long\n", __func__);
             return 1;
@@ -1871,6 +1983,19 @@ int main(int argc, char ** argv) {
                 throw std::runtime_error("--gemma4-mtp-step-compare requires --gemma4-mtp-sidecar");
             }
             json report = run_step_compare(ctx_dft, *mtp, n_past_dft, *step_compare, vocab_dft);
+            if (report_path) {
+                std::ofstream out(*report_path);
+                if (!out) {
+                    throw std::runtime_error("failed to open report path");
+                }
+                out << report.dump(2);
+            } else {
+                LOG("%s\n", report.dump(2).c_str());
+            }
+            return 0;
+        }
+        if (base_compare) {
+            json report = run_live_base_compare(ctx_dft, *live_fixture, vocab_dft);
             if (report_path) {
                 std::ofstream out(*report_path);
                 if (!out) {
