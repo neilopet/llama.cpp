@@ -809,14 +809,353 @@ struct proto_metrics {
     int mtp_steps = 0;
 };
 
-static mtp_step_output run_mtp_step(const mtp_sidecar & sc, int input_pos, const std::vector<float> & activations, const exported_kv & kv, int active_len) {
+struct mtp_layer_trace {
+    std::vector<float> hidden_in;
+    std::vector<float> q_rope;
+    std::vector<float> attn;
+    std::vector<float> post_norm;
+    std::vector<float> hidden_after_attn;
+    std::vector<float> ff_out_norm;
+    std::vector<float> hidden_after_ff;
+};
+
+struct mtp_trace_output {
+    int token = -1;
+    std::vector<float> hidden;
+    std::vector<float> logits;
+    std::vector<float> final_hidden;
+    std::vector<mtp_layer_trace> layers;
+};
+
+struct oracle_fixture {
+    int draft_input_pos = 0;
+    int active_len = 0;
+    int max_seq_len = 0;
+    int good_token = -1;
+    std::vector<float> activations;
+    std::vector<uint8_t> mask;
+    std::vector<int8_t> k13;
+    std::vector<int8_t> k14;
+    std::vector<int8_t> v13;
+    std::vector<int8_t> v14;
+    mtp_trace_output expected;
+};
+
+static std::vector<uint32_t> read_u32_file(const fs::path & path) {
+    auto bytes = read_file_bytes(path);
+    if (bytes.size() % sizeof(uint32_t) != 0) {
+        throw std::runtime_error("invalid u32 blob size for " + path.string());
+    }
+    std::vector<uint32_t> out(bytes.size() / sizeof(uint32_t));
+    std::memcpy(out.data(), bytes.data(), bytes.size());
+    return out;
+}
+
+static std::vector<int8_t> read_i8_file(const fs::path & path) {
+    auto bytes = read_file_bytes(path);
+    return std::vector<int8_t>(reinterpret_cast<const int8_t *>(bytes.data()),
+            reinterpret_cast<const int8_t *>(bytes.data() + bytes.size()));
+}
+
+static std::vector<uint8_t> read_u8_file(const fs::path & path) {
+    return read_file_bytes(path);
+}
+
+static oracle_fixture load_mtp_oracle_fixture(const fs::path & dir) {
+    const json cfg = json::parse(read_file_bytes(dir / "config.json"));
+    if (cfg.at("format").get<std::string>() != "gemma4_e2b_mtp_oracle_fixture_v1") {
+        throw std::runtime_error("unexpected oracle fixture format");
+    }
+    oracle_fixture fx;
+    fx.draft_input_pos = cfg.at("draft_input_pos").get<int>();
+    fx.active_len = cfg.at("active_len").get<int>();
+    fx.max_seq_len = cfg.at("max_seq_len").get<int>();
+    fx.good_token = cfg.at("good_token").get<int>();
+    fx.activations = read_f32_file(dir / cfg.at("inputs").at("activations").at("file").get<std::string>());
+    fx.mask = read_u8_file(dir / cfg.at("inputs").at("mask").at("file").get<std::string>());
+    fx.k13 = read_i8_file(dir / cfg.at("inputs").at("k13").at("file").get<std::string>());
+    fx.k14 = read_i8_file(dir / cfg.at("inputs").at("k14").at("file").get<std::string>());
+    fx.v13 = read_i8_file(dir / cfg.at("inputs").at("v13").at("file").get<std::string>());
+    fx.v14 = read_i8_file(dir / cfg.at("inputs").at("v14").at("file").get<std::string>());
+    fx.expected.logits = read_f32_file(dir / cfg.at("expected").at("logits").at("file").get<std::string>());
+    fx.expected.hidden = read_f32_file(dir / cfg.at("expected").at("hidden").at("file").get<std::string>());
+    fx.expected.final_hidden = read_f32_file(dir / cfg.at("expected").at("final_hidden").at("file").get<std::string>());
+    fx.expected.token = cfg.at("expected").at("top_token").get<int>();
+    for (const auto & layer : cfg.at("trace").at("layers")) {
+        mtp_layer_trace out;
+        out.hidden_in = read_f32_file(dir / layer.at("hidden_in").at("file").get<std::string>());
+        out.q_rope = read_f32_file(dir / layer.at("q_rope").at("file").get<std::string>());
+        out.attn = read_f32_file(dir / layer.at("attn").at("file").get<std::string>());
+        out.post_norm = read_f32_file(dir / layer.at("post_norm").at("file").get<std::string>());
+        out.hidden_after_attn = read_f32_file(dir / layer.at("hidden_after_attn").at("file").get<std::string>());
+        out.ff_out_norm = read_f32_file(dir / layer.at("ff_out_norm").at("file").get<std::string>());
+        out.hidden_after_ff = read_f32_file(dir / layer.at("hidden_after_ff").at("file").get<std::string>());
+        fx.expected.layers.push_back(std::move(out));
+    }
+    return fx;
+}
+
+static double cosine_similarity(const std::vector<float> & a, const std::vector<float> & b) {
+    if (a.size() != b.size() || a.empty()) {
+        return 0.0;
+    }
+    double dot = 0.0;
+    double an = 0.0;
+    double bn = 0.0;
+    for (size_t i = 0; i < a.size(); ++i) {
+        dot += (double) a[i] * (double) b[i];
+        an += (double) a[i] * (double) a[i];
+        bn += (double) b[i] * (double) b[i];
+    }
+    if (an <= 0.0 || bn <= 0.0) {
+        return 0.0;
+    }
+    return dot / std::sqrt(an * bn);
+}
+
+static json compare_vec(const std::vector<float> & expected, const std::vector<float> & actual, int topk = 8) {
+    if (expected.size() != actual.size()) {
+        return {
+            {"size_mismatch", true},
+            {"expected_elements", expected.size()},
+            {"actual_elements", actual.size()},
+        };
+    }
+    double sum_abs = 0.0;
+    float max_abs = 0.0f;
+    for (size_t i = 0; i < expected.size(); ++i) {
+        const float diff = std::fabs(expected[i] - actual[i]);
+        sum_abs += diff;
+        max_abs = std::max(max_abs, diff);
+    }
+    json out = {
+        {"elements", expected.size()},
+        {"max_abs_diff", max_abs},
+        {"mean_abs_diff", expected.empty() ? 0.0 : sum_abs / (double) expected.size()},
+        {"cosine_similarity", cosine_similarity(expected, actual)},
+    };
+    if ((int) expected.size() == MTP_VOCAB) {
+        const int tok_expected = argmax_logits(expected.data(), (int) expected.size());
+        const int tok_actual = argmax_logits(actual.data(), (int) actual.size());
+        out["expected_top_token"] = tok_expected;
+        out["actual_top_token"] = tok_actual;
+        out["top1_match"] = tok_expected == tok_actual;
+    }
+    GGML_UNUSED(topk);
+    return out;
+}
+
+static std::vector<float> runtime_bmm_qk_seq_major_padded(const std::vector<float> & query, int query_rows, int dim, const std::vector<int8_t> & cache_seq_major, int active_len, int max_seq_len, float scale) {
+    if ((int) query.size() != query_rows * dim) {
+        throw std::runtime_error("runtime_bmm_qk_seq_major_padded query shape mismatch");
+    }
+    if ((int) cache_seq_major.size() != max_seq_len * dim) {
+        throw std::runtime_error("runtime_bmm_qk_seq_major_padded cache shape mismatch");
+    }
+    std::vector<float> out(query_rows * max_seq_len, 0.0f);
+    for (int r = 0; r < query_rows; ++r) {
+        const float * q = query.data() + r*dim;
+        float * dst = out.data() + r*max_seq_len;
+        for (int seq = 0; seq < active_len; ++seq) {
+            const int8_t * k = cache_seq_major.data() + seq*dim;
+            float acc = 0.0f;
+            for (int c = 0; c < dim; ++c) {
+                acc += q[c] * (float) k[c];
+            }
+            dst[seq] = acc * scale;
+        }
+    }
+    return out;
+}
+
+static std::vector<float> masked_softmax_rows_mask(const std::vector<float> & scores, int rows, int cols, const std::vector<uint8_t> & mask) {
+    if ((int) scores.size() != rows * cols) {
+        throw std::runtime_error("masked_softmax_rows_mask scores shape mismatch");
+    }
+    if ((int) mask.size() != cols) {
+        throw std::runtime_error("masked_softmax_rows_mask mask shape mismatch");
+    }
+    std::vector<float> out(rows * cols, 0.0f);
+    for (int row = 0; row < rows; ++row) {
+        const float * src = scores.data() + row*cols;
+        float * dst = out.data() + row*cols;
+        float max_score = -INFINITY;
+        for (int col = 0; col < cols; ++col) {
+            const float v = mask[col] ? src[col] : -INFINITY;
+            dst[col] = v;
+            if (v > max_score) {
+                max_score = v;
+            }
+        }
+        if (!std::isfinite(max_score)) {
+            continue;
+        }
+        float sum = 0.0f;
+        for (int col = 0; col < cols; ++col) {
+            if (std::isfinite(dst[col])) {
+                dst[col] = std::exp(dst[col] - max_score);
+                sum += dst[col];
+            } else {
+                dst[col] = 0.0f;
+            }
+        }
+        if (sum > 0.0f) {
+            for (int col = 0; col < cols; ++col) {
+                dst[col] /= sum;
+            }
+        }
+    }
+    return out;
+}
+
+static std::vector<float> runtime_bmm_v_padded(const std::vector<float> & probs, int query_rows, int max_seq_len, const std::vector<int8_t> & cache_dim_major, int dim, int active_len, float scale) {
+    if ((int) probs.size() != query_rows * max_seq_len) {
+        throw std::runtime_error("runtime_bmm_v_padded probs shape mismatch");
+    }
+    if ((int) cache_dim_major.size() != dim * max_seq_len) {
+        throw std::runtime_error("runtime_bmm_v_padded cache shape mismatch");
+    }
+    std::vector<float> out(query_rows * dim, 0.0f);
+    for (int r = 0; r < query_rows; ++r) {
+        const float * p = probs.data() + r*max_seq_len;
+        float * dst = out.data() + r*dim;
+        for (int d = 0; d < dim; ++d) {
+            const int8_t * src = cache_dim_major.data() + d*max_seq_len;
+            float acc = 0.0f;
+            for (int seq = 0; seq < active_len; ++seq) {
+                acc += p[seq] * ((float) src[seq] * scale);
+            }
+            dst[d] = acc;
+        }
+    }
+    return out;
+}
+
+static mtp_trace_output run_mtp_step_unpadded_traced(const mtp_sidecar & sc, int input_pos, const std::vector<float> & activations, const exported_kv & kv, int active_len) {
     if ((int) activations.size() != MTP_DIM_IN) {
         throw std::runtime_error("mtp activations size mismatch");
     }
 
     std::vector<float> hidden = sc.pre_project.run(activations);
     hidden = rms_norm_last_dim(hidden, sc.pre_project_norm_weight, MTP_EPS);
+    mtp_trace_output trace;
 
+    for (const auto & layer : sc.layers) {
+        mtp_layer_trace layer_trace;
+        layer_trace.hidden_in = hidden;
+        auto pre = rms_norm_last_dim(hidden, layer.pre_attn_norm_weight, MTP_EPS);
+        auto q = layer.q_proj.run(pre);
+        q = rms_norm_last_dim(q, layer.query_norm_weight, MTP_EPS);
+        q = apply_rope(q, layer.heads, layer.head_dim, layer.rope_div, input_pos);
+        layer_trace.q_rope = q;
+
+        const std::vector<int8_t> & k_cache = (layer.kv_group == 13) ? kv.k13 : kv.k14;
+        const std::vector<int8_t> & v_cache = (layer.kv_group == 13) ? kv.v13 : kv.v14;
+        const float k_scale = (layer.kv_group == 13) ? sc.k13_scale : sc.k14_scale;
+        const float v_scale = (layer.kv_group == 13) ? sc.v13_scale : sc.v14_scale;
+        auto scores = runtime_bmm_qk_seq_major(q, layer.heads, layer.head_dim, k_cache, active_len, k_scale);
+        auto probs = masked_softmax_rows_prefix(scores, layer.heads, active_len);
+        auto attn = runtime_bmm_v_dim_major(probs, layer.heads, active_len, v_cache, layer.head_dim, v_scale);
+        layer_trace.attn = attn;
+        auto post = layer.o_proj.run(attn);
+        post = rms_norm_last_dim(post, layer.post_attn_norm_weight, MTP_EPS);
+        layer_trace.post_norm = post;
+        hidden = add_vec(hidden, post);
+        layer_trace.hidden_after_attn = hidden;
+
+        auto ff_in = rms_norm_last_dim(hidden, layer.pre_ffw_norm_weight, MTP_EPS);
+        auto gate = gelu_vec(layer.gate_proj.run(ff_in));
+        auto up = layer.up_proj.run(ff_in);
+        auto gated = mul_vec(gate, up);
+        auto ff_out = layer.down_proj.run(gated);
+        ff_out = rms_norm_last_dim(ff_out, layer.post_ffw_norm_weight, MTP_EPS);
+        layer_trace.ff_out_norm = ff_out;
+        hidden = add_vec(hidden, ff_out);
+        layer_trace.hidden_after_ff = hidden;
+        trace.layers.push_back(std::move(layer_trace));
+    }
+
+    trace.final_hidden = rms_norm_last_dim(hidden, sc.final_norm_weight, MTP_EPS);
+    trace.logits = sc.logits_head.run(trace.final_hidden);
+    for (float & value : trace.logits) {
+        value = std::tanh(value * sc.logits_soft_cap_mul_in) * sc.logits_soft_cap_mul_out;
+    }
+    trace.token = argmax_logits(trace.logits.data(), (int) trace.logits.size());
+    trace.hidden = sc.hidden_head.run(trace.final_hidden);
+    return trace;
+}
+
+static mtp_trace_output run_mtp_step_padded_traced(const mtp_sidecar & sc, const oracle_fixture & fx) {
+    if ((int) fx.activations.size() != MTP_DIM_IN) {
+        throw std::runtime_error("mtp activations size mismatch");
+    }
+
+    std::vector<float> hidden = sc.pre_project.run(fx.activations);
+    hidden = rms_norm_last_dim(hidden, sc.pre_project_norm_weight, MTP_EPS);
+    mtp_trace_output trace;
+
+    for (const auto & layer : sc.layers) {
+        mtp_layer_trace layer_trace;
+        layer_trace.hidden_in = hidden;
+        auto pre = rms_norm_last_dim(hidden, layer.pre_attn_norm_weight, MTP_EPS);
+        auto q = layer.q_proj.run(pre);
+        q = rms_norm_last_dim(q, layer.query_norm_weight, MTP_EPS);
+        q = apply_rope(q, layer.heads, layer.head_dim, layer.rope_div, fx.draft_input_pos);
+        layer_trace.q_rope = q;
+
+        const std::vector<int8_t> & k_cache = (layer.kv_group == 13) ? fx.k13 : fx.k14;
+        const std::vector<int8_t> & v_cache = (layer.kv_group == 13) ? fx.v13 : fx.v14;
+        const float k_scale = (layer.kv_group == 13) ? sc.k13_scale : sc.k14_scale;
+        const float v_scale = (layer.kv_group == 13) ? sc.v13_scale : sc.v14_scale;
+        auto scores = runtime_bmm_qk_seq_major_padded(q, layer.heads, layer.head_dim, k_cache, fx.active_len, fx.max_seq_len, k_scale);
+        auto probs = masked_softmax_rows_mask(scores, layer.heads, fx.max_seq_len, fx.mask);
+        auto attn = runtime_bmm_v_padded(probs, layer.heads, fx.max_seq_len, v_cache, layer.head_dim, fx.active_len, v_scale);
+        layer_trace.attn = attn;
+        auto post = layer.o_proj.run(attn);
+        post = rms_norm_last_dim(post, layer.post_attn_norm_weight, MTP_EPS);
+        layer_trace.post_norm = post;
+        hidden = add_vec(hidden, post);
+        layer_trace.hidden_after_attn = hidden;
+
+        auto ff_in = rms_norm_last_dim(hidden, layer.pre_ffw_norm_weight, MTP_EPS);
+        auto gate = gelu_vec(layer.gate_proj.run(ff_in));
+        auto up = layer.up_proj.run(ff_in);
+        auto gated = mul_vec(gate, up);
+        auto ff_out = layer.down_proj.run(gated);
+        ff_out = rms_norm_last_dim(ff_out, layer.post_ffw_norm_weight, MTP_EPS);
+        layer_trace.ff_out_norm = ff_out;
+        hidden = add_vec(hidden, ff_out);
+        layer_trace.hidden_after_ff = hidden;
+        trace.layers.push_back(std::move(layer_trace));
+    }
+
+    trace.final_hidden = rms_norm_last_dim(hidden, sc.final_norm_weight, MTP_EPS);
+    trace.logits = sc.logits_head.run(trace.final_hidden);
+    for (float & value : trace.logits) {
+        value = std::tanh(value * sc.logits_soft_cap_mul_in) * sc.logits_soft_cap_mul_out;
+    }
+    trace.token = argmax_logits(trace.logits.data(), (int) trace.logits.size());
+    trace.hidden = sc.hidden_head.run(trace.final_hidden);
+    return trace;
+}
+
+static mtp_step_output run_mtp_step_padded(
+        const mtp_sidecar & sc,
+        int input_pos,
+        const std::vector<float> & activations,
+        const exported_kv & kv,
+        int active_len,
+        int max_seq_len) {
+    if ((int) activations.size() != MTP_DIM_IN) {
+        throw std::runtime_error("mtp activations size mismatch");
+    }
+    std::vector<uint8_t> mask(max_seq_len, 0);
+    for (int i = 0; i < active_len && i < max_seq_len; ++i) {
+        mask[i] = 1;
+    }
+
+    std::vector<float> hidden = sc.pre_project.run(activations);
+    hidden = rms_norm_last_dim(hidden, sc.pre_project_norm_weight, MTP_EPS);
     for (const auto & layer : sc.layers) {
         auto pre = rms_norm_last_dim(hidden, layer.pre_attn_norm_weight, MTP_EPS);
         auto q = layer.q_proj.run(pre);
@@ -827,9 +1166,9 @@ static mtp_step_output run_mtp_step(const mtp_sidecar & sc, int input_pos, const
         const std::vector<int8_t> & v_cache = (layer.kv_group == 13) ? kv.v13 : kv.v14;
         const float k_scale = (layer.kv_group == 13) ? sc.k13_scale : sc.k14_scale;
         const float v_scale = (layer.kv_group == 13) ? sc.v13_scale : sc.v14_scale;
-        auto scores = runtime_bmm_qk_seq_major(q, layer.heads, layer.head_dim, k_cache, active_len, k_scale);
-        auto probs = masked_softmax_rows_prefix(scores, layer.heads, active_len);
-        auto attn = runtime_bmm_v_dim_major(probs, layer.heads, active_len, v_cache, layer.head_dim, v_scale);
+        auto scores = runtime_bmm_qk_seq_major_padded(q, layer.heads, layer.head_dim, k_cache, active_len, max_seq_len, k_scale);
+        auto probs = masked_softmax_rows_mask(scores, layer.heads, max_seq_len, mask);
+        auto attn = runtime_bmm_v_padded(probs, layer.heads, max_seq_len, v_cache, layer.head_dim, active_len, v_scale);
         auto post = layer.o_proj.run(attn);
         post = rms_norm_last_dim(post, layer.post_attn_norm_weight, MTP_EPS);
         hidden = add_vec(hidden, post);
@@ -844,9 +1183,19 @@ static mtp_step_output run_mtp_step(const mtp_sidecar & sc, int input_pos, const
     }
 
     auto final_hidden = rms_norm_last_dim(hidden, sc.final_norm_weight, MTP_EPS);
+    auto logits = sc.logits_head.run(final_hidden);
+    for (float & value : logits) {
+        value = std::tanh(value * sc.logits_soft_cap_mul_in) * sc.logits_soft_cap_mul_out;
+    }
     const int token = sc.logits_head.argmax_softcapped(final_hidden, sc.logits_soft_cap_mul_in, sc.logits_soft_cap_mul_out);
     auto next_hidden = sc.hidden_head.run(final_hidden);
+    GGML_UNUSED(logits);
     return { token, std::move(next_hidden) };
+}
+
+static mtp_step_output run_mtp_step(const mtp_sidecar & sc, int input_pos, const std::vector<float> & activations, const exported_kv & kv, int active_len) {
+    auto traced = run_mtp_step_unpadded_traced(sc, input_pos, activations, kv, active_len);
+    return { traced.token, std::move(traced.hidden) };
 }
 
 struct snapshot {
@@ -928,8 +1277,9 @@ static std::vector<llama_token> build_nested_mtp_draft_chunk(
         return draft;
     }
 
+    const int padded_len = n_past_dft + draft_max;
     const auto t_kv0 = std::chrono::steady_clock::now();
-    exported_kv kv = export_current_kv(ctx_dft, sc, n_past_dft, n_past_dft + draft_max);
+    exported_kv kv = export_current_kv(ctx_dft, sc, n_past_dft, padded_len);
     if (timing) {
         timing->kv_export_s += std::chrono::duration<double>(std::chrono::steady_clock::now() - t_kv0).count();
     }
@@ -944,7 +1294,7 @@ static std::vector<llama_token> build_nested_mtp_draft_chunk(
         activations.insert(activations.end(), hidden.begin(), hidden.end());
 
         const auto t_step0 = std::chrono::steady_clock::now();
-        auto out = run_mtp_step(sc, n_past_dft + (step - 1), activations, kv, n_past_dft + step);
+        auto out = run_mtp_step_padded(sc, n_past_dft + (step - 1), activations, kv, n_past_dft + step, padded_len);
         if (timing) {
             timing->mtp_step_s += std::chrono::duration<double>(std::chrono::steady_clock::now() - t_step0).count();
             timing->mtp_steps += 1;
@@ -1022,7 +1372,13 @@ static verify_result verify_draft_chunk(
     return result;
 }
 
-static std::vector<std::string> strip_custom_args(int argc, char ** argv, std::optional<std::string> & sidecar_dir, std::optional<std::string> & report_path, bool & draft_only) {
+static std::vector<std::string> strip_custom_args(
+        int argc,
+        char ** argv,
+        std::optional<std::string> & sidecar_dir,
+        std::optional<std::string> & fixture_dir,
+        std::optional<std::string> & report_path,
+        bool & draft_only) {
     std::vector<std::string> out;
     out.reserve(argc);
     out.push_back(argv[0]);
@@ -1033,6 +1389,13 @@ static std::vector<std::string> strip_custom_args(int argc, char ** argv, std::o
                 throw std::runtime_error("--gemma4-mtp-sidecar requires a directory");
             }
             sidecar_dir = argv[++i];
+            continue;
+        }
+        if (arg == "--gemma4-mtp-fixture") {
+            if (i + 1 >= argc) {
+                throw std::runtime_error("--gemma4-mtp-fixture requires a directory");
+            }
+            fixture_dir = argv[++i];
             continue;
         }
         if (arg == "--gemma4-mtp-draft-only") {
@@ -1056,9 +1419,10 @@ int main(int argc, char ** argv) {
         std::setlocale(LC_NUMERIC, "C");
 
         std::optional<std::string> sidecar_dir;
+        std::optional<std::string> fixture_dir;
         std::optional<std::string> report_path;
         bool draft_only = false;
-        std::vector<std::string> stripped = strip_custom_args(argc, argv, sidecar_dir, report_path, draft_only);
+        std::vector<std::string> stripped = strip_custom_args(argc, argv, sidecar_dir, fixture_dir, report_path, draft_only);
         std::vector<char *> argv2;
         argv2.reserve(stripped.size());
         for (auto & s : stripped) {
@@ -1066,6 +1430,83 @@ int main(int argc, char ** argv) {
         }
         argc = (int) argv2.size();
         argv = argv2.data();
+
+        const bool use_mtp = sidecar_dir.has_value();
+        const bool offline_fixture = fixture_dir.has_value();
+        proto_metrics metrics;
+        metrics.draft_only = draft_only;
+        metrics.use_mtp = use_mtp;
+        std::optional<mtp_sidecar> mtp;
+        if (use_mtp) {
+            mtp.emplace(load_mtp_sidecar(*sidecar_dir));
+        }
+
+        if (offline_fixture) {
+            if (!mtp) {
+                throw std::runtime_error("--gemma4-mtp-fixture requires --gemma4-mtp-sidecar");
+            }
+            oracle_fixture fx = load_mtp_oracle_fixture(*fixture_dir);
+            exported_kv kv {
+                fx.k13,
+                fx.v13,
+                fx.k14,
+                fx.v14,
+            };
+            auto unpadded = run_mtp_step_unpadded_traced(*mtp, fx.draft_input_pos, fx.activations, kv, fx.active_len);
+            auto padded = run_mtp_step_padded_traced(*mtp, fx);
+            json layer_reports = json::array();
+            for (size_t i = 0; i < fx.expected.layers.size(); ++i) {
+                const auto & exp = fx.expected.layers.at(i);
+                const auto & unp = unpadded.layers.at(i);
+                const auto & pad = padded.layers.at(i);
+                layer_reports.push_back({
+                    {"layer_index", i},
+                    {"hidden_in_unpadded", compare_vec(exp.hidden_in, unp.hidden_in)},
+                    {"hidden_in_padded", compare_vec(exp.hidden_in, pad.hidden_in)},
+                    {"q_rope_unpadded", compare_vec(exp.q_rope, unp.q_rope)},
+                    {"q_rope_padded", compare_vec(exp.q_rope, pad.q_rope)},
+                    {"attn_unpadded", compare_vec(exp.attn, unp.attn)},
+                    {"attn_padded", compare_vec(exp.attn, pad.attn)},
+                    {"post_norm_unpadded", compare_vec(exp.post_norm, unp.post_norm)},
+                    {"post_norm_padded", compare_vec(exp.post_norm, pad.post_norm)},
+                    {"hidden_after_attn_unpadded", compare_vec(exp.hidden_after_attn, unp.hidden_after_attn)},
+                    {"hidden_after_attn_padded", compare_vec(exp.hidden_after_attn, pad.hidden_after_attn)},
+                    {"ff_out_norm_unpadded", compare_vec(exp.ff_out_norm, unp.ff_out_norm)},
+                    {"ff_out_norm_padded", compare_vec(exp.ff_out_norm, pad.ff_out_norm)},
+                    {"hidden_after_ff_unpadded", compare_vec(exp.hidden_after_ff, unp.hidden_after_ff)},
+                    {"hidden_after_ff_padded", compare_vec(exp.hidden_after_ff, pad.hidden_after_ff)},
+                });
+            }
+            json report = {
+                {"mode", "offline_fixture_compare"},
+                {"fixture_dir", *fixture_dir},
+                {"sidecar_dir", *sidecar_dir},
+                {"oracle", {
+                    {"expected_token", fx.expected.token},
+                }},
+                {"unpadded", {
+                    {"logits", compare_vec(fx.expected.logits, unpadded.logits)},
+                    {"hidden", compare_vec(fx.expected.hidden, unpadded.hidden)},
+                    {"final_hidden", compare_vec(fx.expected.final_hidden, unpadded.final_hidden)},
+                }},
+                {"padded", {
+                    {"logits", compare_vec(fx.expected.logits, padded.logits)},
+                    {"hidden", compare_vec(fx.expected.hidden, padded.hidden)},
+                    {"final_hidden", compare_vec(fx.expected.final_hidden, padded.final_hidden)},
+                }},
+                {"layers", layer_reports},
+            };
+            if (report_path) {
+                std::ofstream out(*report_path);
+                if (!out) {
+                    throw std::runtime_error("failed to open report path");
+                }
+                out << report.dump(2);
+            } else {
+                LOG("%s\n", report.dump(2).c_str());
+            }
+            return 0;
+        }
 
         common_params params;
 
@@ -1084,15 +1525,6 @@ int main(int argc, char ** argv) {
         if (!draft_only && params.speculative.mparams_dft.path.empty()) {
             LOG_ERR("%s: --model-draft is required unless --gemma4-mtp-draft-only is set\n", __func__);
             return 1;
-        }
-
-        const bool use_mtp = sidecar_dir.has_value();
-        proto_metrics metrics;
-        metrics.draft_only = draft_only;
-        metrics.use_mtp = use_mtp;
-        std::optional<mtp_sidecar> mtp;
-        if (use_mtp) {
-            mtp.emplace(load_mtp_sidecar(*sidecar_dir));
         }
 
         llama_backend_init();
