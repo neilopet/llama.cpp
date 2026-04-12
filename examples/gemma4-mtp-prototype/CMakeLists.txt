@@ -1,0 +1,6 @@
+set(TARGET llama-gemma4-mtp-prototype)
+add_executable(${TARGET} gemma4-mtp-prototype.cpp)
+install(TARGETS ${TARGET} RUNTIME)
+target_link_libraries(${TARGET} PRIVATE common llama ${CMAKE_THREAD_LIBS_INIT})
+target_include_directories(${TARGET} PRIVATE ${CMAKE_SOURCE_DIR}/src ${CMAKE_SOURCE_DIR}/ggml/include)
+target_compile_features(${TARGET} PRIVATE cxx_std_17)
