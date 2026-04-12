@@ -973,6 +973,20 @@ static json compare_vec(const std::vector<float> & expected, const std::vector<f
     return out;
 }
 
+static int rank_of_token(const float * logits, int n_vocab, int token) {
+    if (token < 0 || token >= n_vocab) {
+        return -1;
+    }
+    const float target = logits[token];
+    int rank = 1;
+    for (int i = 0; i < n_vocab; ++i) {
+        if (logits[i] > target) {
+            rank += 1;
+        }
+    }
+    return rank;
+}
+
 static std::vector<float> runtime_bmm_qk_seq_major_padded(const std::vector<float> & query, int query_rows, int dim, const std::vector<int8_t> & cache_seq_major, int active_len, int max_seq_len, float scale) {
     if ((int) query.size() != query_rows * dim) {
         throw std::runtime_error("runtime_bmm_qk_seq_major_padded query shape mismatch");
@@ -1400,11 +1414,174 @@ static verify_result verify_draft_chunk(
     return result;
 }
 
+static json run_step_compare(
+        llama_context * ctx_dft,
+        const mtp_sidecar & sc,
+        int n_past_dft,
+        int n_steps,
+        const llama_vocab * vocab) {
+    if (n_steps <= 0) {
+        throw std::runtime_error("step compare requires n_steps > 0");
+    }
+    const int n_vocab = llama_vocab_n_tokens(vocab);
+    const float * start_logits = llama_get_logits_ith(ctx_dft, -1);
+    const float * start_hidden = llama_get_embeddings_ith(ctx_dft, -1);
+    if (!start_logits || !start_hidden) {
+        throw std::runtime_error("draft logits/hidden unavailable for step compare");
+    }
+
+    snapshot snap = take_snapshot(ctx_dft);
+    int tmp_n_past = n_past_dft;
+    const int fixed_total_len = n_past_dft + n_steps + 1;
+    exported_kv fixed_kv = export_current_kv(ctx_dft, sc, n_past_dft, fixed_total_len);
+
+    std::vector<float> prev_base_hidden(start_hidden, start_hidden + MTP_DIM_OUT_HIDDEN);
+    std::vector<float> current_chain_hidden = prev_base_hidden;
+    llama_token current_input = argmax_logits_skip_eog(vocab, start_logits, n_vocab);
+    llama_token current_chain_last = current_input;
+
+    json steps = json::array();
+    for (int step = 1; step <= n_steps; ++step) {
+        decode_tokens(ctx_dft, { current_input }, tmp_n_past, true);
+        const float * base_logits = llama_get_logits_ith(ctx_dft, -1);
+        const float * base_hidden_ptr = llama_get_embeddings_ith(ctx_dft, -1);
+        if (!base_logits || !base_hidden_ptr) {
+            throw std::runtime_error("base logits/hidden unavailable during step compare");
+        }
+        std::vector<float> base_hidden(base_hidden_ptr, base_hidden_ptr + MTP_DIM_OUT_HIDDEN);
+        const llama_token base_next = argmax_logits_skip_eog(vocab, base_logits, n_vocab);
+
+        auto build_activations = [&](llama_token token, const std::vector<float> & hidden) {
+            auto embed = sc.lookup_embedder(token);
+            std::vector<float> activations;
+            activations.reserve(embed.size() + hidden.size());
+            activations.insert(activations.end(), embed.begin(), embed.end());
+            activations.insert(activations.end(), hidden.begin(), hidden.end());
+            return activations;
+        };
+
+        const auto fixed_reset_activations = build_activations(current_input, prev_base_hidden);
+        auto fixed_reset = run_mtp_step_padded(
+                sc,
+                tmp_n_past - 1,
+                fixed_reset_activations,
+                fixed_kv,
+                tmp_n_past,
+                fixed_total_len);
+
+        exported_kv fresh_kv = export_current_kv(ctx_dft, sc, tmp_n_past, tmp_n_past + 1);
+        const auto fresh_reset_activations = build_activations(current_input, prev_base_hidden);
+        auto fresh_reset = run_mtp_step_padded(
+                sc,
+                tmp_n_past - 1,
+                fresh_reset_activations,
+                fresh_kv,
+                tmp_n_past,
+                tmp_n_past + 1);
+
+        const auto current_chain_activations = build_activations(current_chain_last, current_chain_hidden);
+        auto current_chain = run_mtp_step_padded(
+                sc,
+                tmp_n_past - 1,
+                current_chain_activations,
+                fixed_kv,
+                tmp_n_past,
+                fixed_total_len);
+
+        auto fresh_chain = run_mtp_step_padded(
+                sc,
+                tmp_n_past - 1,
+                current_chain_activations,
+                fresh_kv,
+                tmp_n_past,
+                tmp_n_past + 1);
+
+        // For ranks, recompute logits using the traced path.
+        oracle_fixture fresh_fx;
+        fresh_fx.draft_input_pos = tmp_n_past - 1;
+        fresh_fx.active_len = tmp_n_past;
+        fresh_fx.max_seq_len = tmp_n_past + 1;
+        fresh_fx.activations = fresh_reset_activations;
+        fresh_fx.mask.assign(fresh_fx.max_seq_len, 0);
+        for (int i = 0; i < fresh_fx.active_len && i < fresh_fx.max_seq_len; ++i) {
+            fresh_fx.mask[i] = 1;
+        }
+        fresh_fx.k13 = fresh_kv.k13;
+        fresh_fx.k14 = fresh_kv.k14;
+        fresh_fx.v13 = fresh_kv.v13;
+        fresh_fx.v14 = fresh_kv.v14;
+        auto fresh_reset_traced = run_mtp_step_padded_traced(sc, fresh_fx);
+
+        oracle_fixture fixed_fx = fresh_fx;
+        fixed_fx.max_seq_len = fixed_total_len;
+        fixed_fx.mask.assign(fixed_total_len, 0);
+        for (int i = 0; i < tmp_n_past && i < fixed_total_len; ++i) {
+            fixed_fx.mask[i] = 1;
+        }
+        fixed_fx.k13 = fixed_kv.k13;
+        fixed_fx.k14 = fixed_kv.k14;
+        fixed_fx.v13 = fixed_kv.v13;
+        fixed_fx.v14 = fixed_kv.v14;
+        auto fixed_reset_traced = run_mtp_step_padded_traced(sc, fixed_fx);
+
+        oracle_fixture current_chain_fx = fixed_fx;
+        current_chain_fx.activations = current_chain_activations;
+        auto current_chain_traced = run_mtp_step_padded_traced(sc, current_chain_fx);
+
+        oracle_fixture fresh_chain_fx = fresh_fx;
+        fresh_chain_fx.activations = current_chain_activations;
+        auto fresh_chain_traced = run_mtp_step_padded_traced(sc, fresh_chain_fx);
+
+        steps.push_back({
+            {"step_index", step},
+            {"input_token", current_input},
+            {"base_next_token", base_next},
+            {"base_token_rank_fixed_reset", rank_of_token(fixed_reset_traced.logits.data(), n_vocab, base_next)},
+            {"base_token_rank_fresh_reset", rank_of_token(fresh_reset_traced.logits.data(), n_vocab, base_next)},
+            {"base_token_rank_current_chain", rank_of_token(current_chain_traced.logits.data(), n_vocab, base_next)},
+            {"base_token_rank_fresh_chain", rank_of_token(fresh_chain_traced.logits.data(), n_vocab, base_next)},
+            {"fixed_reset", {
+                {"token", fixed_reset.token},
+                {"top1_match", fixed_reset.token == base_next},
+                {"hidden_cosine_to_base", cosine_similarity(fixed_reset.hidden, base_hidden)},
+            }},
+            {"fresh_reset", {
+                {"token", fresh_reset.token},
+                {"top1_match", fresh_reset.token == base_next},
+                {"hidden_cosine_to_base", cosine_similarity(fresh_reset.hidden, base_hidden)},
+            }},
+            {"current_chain", {
+                {"token", current_chain.token},
+                {"top1_match", current_chain.token == base_next},
+                {"hidden_cosine_to_base", cosine_similarity(current_chain.hidden, base_hidden)},
+            }},
+            {"fresh_chain", {
+                {"token", fresh_chain.token},
+                {"top1_match", fresh_chain.token == base_next},
+                {"hidden_cosine_to_base", cosine_similarity(fresh_chain.hidden, base_hidden)},
+            }},
+        });
+
+        prev_base_hidden = std::move(base_hidden);
+        current_input = base_next;
+        current_chain_last = (llama_token) current_chain.token;
+        current_chain_hidden = std::move(current_chain.hidden);
+    }
+
+    restore_snapshot(ctx_dft, snap);
+    return {
+        {"mode", "step_compare"},
+        {"n_steps", n_steps},
+        {"steps", steps},
+    };
+}
+
 static std::vector<std::string> strip_custom_args(
         int argc,
         char ** argv,
         std::optional<std::string> & sidecar_dir,
         std::optional<std::string> & fixture_dir,
+        std::optional<int> & step_compare,
         std::optional<std::string> & report_path,
         bool & draft_only) {
     std::vector<std::string> out;
@@ -1424,6 +1601,13 @@ static std::vector<std::string> strip_custom_args(
                 throw std::runtime_error("--gemma4-mtp-fixture requires a directory");
             }
             fixture_dir = argv[++i];
+            continue;
+        }
+        if (arg == "--gemma4-mtp-step-compare") {
+            if (i + 1 >= argc) {
+                throw std::runtime_error("--gemma4-mtp-step-compare requires an integer");
+            }
+            step_compare = std::stoi(argv[++i]);
             continue;
         }
         if (arg == "--gemma4-mtp-draft-only") {
@@ -1448,9 +1632,10 @@ int main(int argc, char ** argv) {
 
         std::optional<std::string> sidecar_dir;
         std::optional<std::string> fixture_dir;
+        std::optional<int> step_compare;
         std::optional<std::string> report_path;
         bool draft_only = false;
-        std::vector<std::string> stripped = strip_custom_args(argc, argv, sidecar_dir, fixture_dir, report_path, draft_only);
+        std::vector<std::string> stripped = strip_custom_args(argc, argv, sidecar_dir, fixture_dir, step_compare, report_path, draft_only);
         std::vector<char *> argv2;
         argv2.reserve(stripped.size());
         for (auto & s : stripped) {
@@ -1633,6 +1818,23 @@ int main(int argc, char ** argv) {
             decode_tokens(ctx_tgt, prompt, n_past_tgt, false);
         }
         decode_tokens(ctx_dft, prompt, n_past_dft, true);
+
+        if (step_compare.has_value()) {
+            if (!mtp) {
+                throw std::runtime_error("--gemma4-mtp-step-compare requires --gemma4-mtp-sidecar");
+            }
+            json report = run_step_compare(ctx_dft, *mtp, n_past_dft, *step_compare, vocab_dft);
+            if (report_path) {
+                std::ofstream out(*report_path);
+                if (!out) {
+                    throw std::runtime_error("failed to open report path");
+                }
+                out << report.dump(2);
+            } else {
+                LOG("%s\n", report.dump(2).c_str());
+            }
+            return 0;
+        }
 
         const int draft_max = std::max(1, params.speculative.n_max);
         const int n_predict_max = params.n_predict < 0 ? 256 : params.n_predict;
