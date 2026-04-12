@@ -24,6 +24,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <chrono>
 #include <optional>
 #include <string>
 #include <vector>
@@ -775,6 +776,39 @@ struct mtp_step_output {
     std::vector<float> hidden;
 };
 
+struct mtp_timing {
+    double kv_export_s = 0.0;
+    double mtp_step_s = 0.0;
+    int mtp_steps = 0;
+};
+
+struct verify_result {
+    std::vector<llama_token> accepted;
+    int proposed = 0;
+    int accepted_from_draft = 0;
+    bool full_match = false;
+    bool first_token_mismatch = false;
+};
+
+struct proto_metrics {
+    bool draft_only = false;
+    bool use_mtp = false;
+    int chunks = 0;
+    int proposed_tokens = 0;
+    int accepted_tokens = 0;
+    int accepted_from_draft = 0;
+    int verifier_substitutions = 0;
+    int full_match_chunks = 0;
+    int first_token_mismatches = 0;
+    int emitted_tokens = 0;
+    double draft_build_s = 0.0;
+    double verify_s = 0.0;
+    double draft_sync_s = 0.0;
+    double kv_export_s = 0.0;
+    double mtp_step_s = 0.0;
+    int mtp_steps = 0;
+};
+
 static mtp_step_output run_mtp_step(const mtp_sidecar & sc, int input_pos, const std::vector<float> & activations, const exported_kv & kv, int active_len) {
     if ((int) activations.size() != MTP_DIM_IN) {
         throw std::runtime_error("mtp activations size mismatch");
@@ -883,7 +917,8 @@ static std::vector<llama_token> build_nested_mtp_draft_chunk(
         int draft_max,
         const llama_vocab * vocab,
         const float * current_logits,
-        const float * current_hidden) {
+        const float * current_hidden,
+        mtp_timing * timing = nullptr) {
     std::vector<llama_token> draft;
     draft.reserve(draft_max);
 
@@ -893,7 +928,11 @@ static std::vector<llama_token> build_nested_mtp_draft_chunk(
         return draft;
     }
 
+    const auto t_kv0 = std::chrono::steady_clock::now();
     exported_kv kv = export_current_kv(ctx_dft, sc, n_past_dft, n_past_dft + draft_max);
+    if (timing) {
+        timing->kv_export_s += std::chrono::duration<double>(std::chrono::steady_clock::now() - t_kv0).count();
+    }
     std::vector<float> hidden(current_hidden, current_hidden + MTP_DIM_OUT_HIDDEN);
     llama_token last_token = good;
 
@@ -904,7 +943,12 @@ static std::vector<llama_token> build_nested_mtp_draft_chunk(
         activations.insert(activations.end(), embed.begin(), embed.end());
         activations.insert(activations.end(), hidden.begin(), hidden.end());
 
+        const auto t_step0 = std::chrono::steady_clock::now();
         auto out = run_mtp_step(sc, n_past_dft + (step - 1), activations, kv, n_past_dft + step);
+        if (timing) {
+            timing->mtp_step_s += std::chrono::duration<double>(std::chrono::steady_clock::now() - t_step0).count();
+            timing->mtp_steps += 1;
+        }
         last_token = (llama_token) out.token;
         draft.push_back(last_token);
         hidden = std::move(out.hidden);
@@ -913,30 +957,34 @@ static std::vector<llama_token> build_nested_mtp_draft_chunk(
     return draft;
 }
 
-static std::vector<llama_token> verify_draft_chunk(
+static verify_result verify_draft_chunk(
         llama_context * ctx_tgt,
         int & n_past_tgt,
         const std::vector<llama_token> & draft,
         const llama_vocab * vocab) {
-    std::vector<llama_token> accepted;
-    accepted.reserve(draft.size() + 1);
+    verify_result result;
+    result.proposed = (int) draft.size();
+    result.accepted.reserve(draft.size() + 1);
 
     const int n_vocab = llama_vocab_n_tokens(vocab);
     const llama_token predicted0 = argmax_logits_skip_eog(vocab, llama_get_logits_ith(ctx_tgt, -1), n_vocab);
     if (draft.empty()) {
-        accepted.push_back(predicted0);
-        decode_tokens(ctx_tgt, accepted, n_past_tgt, false);
-        return accepted;
+        result.accepted.push_back(predicted0);
+        decode_tokens(ctx_tgt, result.accepted, n_past_tgt, false);
+        return result;
     }
     if (predicted0 != draft[0]) {
-        accepted.push_back(predicted0);
-        decode_tokens(ctx_tgt, accepted, n_past_tgt, false);
-        return accepted;
+        result.first_token_mismatch = true;
+        result.accepted.push_back(predicted0);
+        decode_tokens(ctx_tgt, result.accepted, n_past_tgt, false);
+        return result;
     }
     if (draft.size() == 1) {
-        accepted.push_back(draft[0]);
-        decode_tokens(ctx_tgt, accepted, n_past_tgt, false);
-        return accepted;
+        result.accepted.push_back(draft[0]);
+        result.accepted_from_draft = 1;
+        result.full_match = true;
+        decode_tokens(ctx_tgt, result.accepted, n_past_tgt, false);
+        return result;
     }
 
     snapshot snap = take_snapshot(ctx_tgt);
@@ -950,9 +998,9 @@ static std::vector<llama_token> verify_draft_chunk(
         if (predicted != draft[i]) {
             full_match = false;
             for (size_t j = 0; j < i; ++j) {
-                accepted.push_back(draft[j]);
+                result.accepted.push_back(draft[j]);
             }
-            accepted.push_back(predicted);
+            result.accepted.push_back(predicted);
             accepted_prefix = i;
             break;
         }
@@ -961,17 +1009,20 @@ static std::vector<llama_token> verify_draft_chunk(
 
     if (full_match) {
         n_past_tgt = tmp_n_past;
-        accepted.assign(draft.begin(), draft.end());
-        return accepted;
+        result.accepted.assign(draft.begin(), draft.end());
+        result.accepted_from_draft = (int) draft.size();
+        result.full_match = true;
+        return result;
     }
 
     restore_snapshot(ctx_tgt, snap);
-    decode_tokens(ctx_tgt, accepted, n_past_tgt, false);
+    result.accepted_from_draft = (int) accepted_prefix;
+    decode_tokens(ctx_tgt, result.accepted, n_past_tgt, false);
     GGML_UNUSED(accepted_prefix);
-    return accepted;
+    return result;
 }
 
-static std::vector<std::string> strip_custom_args(int argc, char ** argv, std::optional<std::string> & sidecar_dir, bool & draft_only) {
+static std::vector<std::string> strip_custom_args(int argc, char ** argv, std::optional<std::string> & sidecar_dir, std::optional<std::string> & report_path, bool & draft_only) {
     std::vector<std::string> out;
     out.reserve(argc);
     out.push_back(argv[0]);
@@ -988,6 +1039,13 @@ static std::vector<std::string> strip_custom_args(int argc, char ** argv, std::o
             draft_only = true;
             continue;
         }
+        if (arg == "--gemma4-mtp-report") {
+            if (i + 1 >= argc) {
+                throw std::runtime_error("--gemma4-mtp-report requires a path");
+            }
+            report_path = argv[++i];
+            continue;
+        }
         out.push_back(std::move(arg));
     }
     return out;
@@ -998,8 +1056,9 @@ int main(int argc, char ** argv) {
         std::setlocale(LC_NUMERIC, "C");
 
         std::optional<std::string> sidecar_dir;
+        std::optional<std::string> report_path;
         bool draft_only = false;
-        std::vector<std::string> stripped = strip_custom_args(argc, argv, sidecar_dir, draft_only);
+        std::vector<std::string> stripped = strip_custom_args(argc, argv, sidecar_dir, report_path, draft_only);
         std::vector<char *> argv2;
         argv2.reserve(stripped.size());
         for (auto & s : stripped) {
@@ -1028,6 +1087,9 @@ int main(int argc, char ** argv) {
         }
 
         const bool use_mtp = sidecar_dir.has_value();
+        proto_metrics metrics;
+        metrics.draft_only = draft_only;
+        metrics.use_mtp = use_mtp;
         std::optional<mtp_sidecar> mtp;
         if (use_mtp) {
             mtp.emplace(load_mtp_sidecar(*sidecar_dir));
@@ -1093,6 +1155,7 @@ int main(int argc, char ** argv) {
         const int draft_max = std::max(1, params.speculative.n_max);
         const int n_predict_max = params.n_predict < 0 ? 256 : params.n_predict;
         int n_predict = 0;
+        std::string generated_text;
 
         while (n_predict < n_predict_max) {
             const float * dft_logits = llama_get_logits_ith(ctx_dft, -1);
@@ -1101,21 +1164,51 @@ int main(int argc, char ** argv) {
                 throw std::runtime_error("draft logits/hidden unavailable");
             }
 
-            std::vector<llama_token> draft = use_mtp
-                ? build_nested_mtp_draft_chunk(ctx_dft, *mtp, n_past_dft, draft_max, vocab_dft, dft_logits, dft_hidden)
-                : build_plain_draft_chunk(ctx_dft, n_past_dft, draft_max, vocab_dft, dft_logits);
+            metrics.chunks += 1;
+            std::vector<llama_token> draft;
+            mtp_timing mtp_t{};
+            const auto t_draft0 = std::chrono::steady_clock::now();
+            if (use_mtp) {
+                draft = build_nested_mtp_draft_chunk(ctx_dft, *mtp, n_past_dft, draft_max, vocab_dft, dft_logits, dft_hidden, &mtp_t);
+            } else {
+                draft = build_plain_draft_chunk(ctx_dft, n_past_dft, draft_max, vocab_dft, dft_logits);
+            }
+            metrics.draft_build_s += std::chrono::duration<double>(std::chrono::steady_clock::now() - t_draft0).count();
+            metrics.kv_export_s += mtp_t.kv_export_s;
+            metrics.mtp_step_s += mtp_t.mtp_step_s;
+            metrics.mtp_steps += mtp_t.mtp_steps;
+            metrics.proposed_tokens += (int) draft.size();
 
-            std::vector<llama_token> accepted = draft_only
-                ? draft
-                : verify_draft_chunk(ctx_tgt, n_past_tgt, draft, vocab_tgt);
+            std::vector<llama_token> accepted;
+            if (draft_only) {
+                accepted = draft;
+                metrics.accepted_tokens += (int) accepted.size();
+                metrics.accepted_from_draft += (int) accepted.size();
+                metrics.full_match_chunks += 1;
+            } else {
+                const auto t_verify0 = std::chrono::steady_clock::now();
+                verify_result vr = verify_draft_chunk(ctx_tgt, n_past_tgt, draft, vocab_tgt);
+                metrics.verify_s += std::chrono::duration<double>(std::chrono::steady_clock::now() - t_verify0).count();
+                accepted = std::move(vr.accepted);
+                metrics.accepted_tokens += (int) accepted.size();
+                metrics.accepted_from_draft += vr.accepted_from_draft;
+                metrics.verifier_substitutions += (int) accepted.size() - vr.accepted_from_draft;
+                metrics.first_token_mismatches += vr.first_token_mismatch ? 1 : 0;
+                metrics.full_match_chunks += vr.full_match ? 1 : 0;
+            }
+            const auto t_sync0 = std::chrono::steady_clock::now();
             decode_tokens(ctx_dft, accepted, n_past_dft, true);
+            metrics.draft_sync_s += std::chrono::duration<double>(std::chrono::steady_clock::now() - t_sync0).count();
 
             for (llama_token tok : accepted) {
                 if (llama_vocab_is_eog(vocab_tgt, tok)) {
                     goto done;
                 }
-                LOG("%s", common_token_to_piece(ctx_out, tok).c_str());
+                auto piece = common_token_to_piece(ctx_out, tok);
+                LOG("%s", piece.c_str());
+                generated_text += piece;
                 ++n_predict;
+                metrics.emitted_tokens += 1;
                 if (n_predict >= n_predict_max) {
                     goto done;
                 }
@@ -1124,6 +1217,34 @@ int main(int argc, char ** argv) {
 
         done:
         LOG("\n\n");
+        if (report_path) {
+            json report = {
+                {"draft_only", metrics.draft_only},
+                {"use_mtp", metrics.use_mtp},
+                {"chunks", metrics.chunks},
+                {"proposed_tokens", metrics.proposed_tokens},
+                {"accepted_tokens", metrics.accepted_tokens},
+                {"accepted_from_draft", metrics.accepted_from_draft},
+                {"verifier_substitutions", metrics.verifier_substitutions},
+                {"full_match_chunks", metrics.full_match_chunks},
+                {"first_token_mismatches", metrics.first_token_mismatches},
+                {"emitted_tokens", metrics.emitted_tokens},
+                {"draft_build_s", metrics.draft_build_s},
+                {"verify_s", metrics.verify_s},
+                {"draft_sync_s", metrics.draft_sync_s},
+                {"kv_export_s", metrics.kv_export_s},
+                {"mtp_step_s", metrics.mtp_step_s},
+                {"mtp_steps", metrics.mtp_steps},
+                {"acceptance_rate", metrics.proposed_tokens > 0 ? (double) metrics.accepted_from_draft / (double) metrics.proposed_tokens : 0.0},
+                {"emitted_per_chunk", metrics.chunks > 0 ? (double) metrics.emitted_tokens / (double) metrics.chunks : 0.0},
+                {"generated_text", generated_text},
+            };
+            std::ofstream out(*report_path);
+            if (!out) {
+                throw std::runtime_error("failed to open report path");
+            }
+            out << report.dump(2);
+        }
         return 0;
     } catch (const std::exception & e) {
         LOG_ERR("%s\n", e.what());
