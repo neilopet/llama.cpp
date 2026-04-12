@@ -828,6 +828,18 @@ struct mtp_trace_output {
 };
 
 struct oracle_fixture {
+    struct chain_step {
+        int step_index = 0;
+        int input_pos = 0;
+        int active_len = 0;
+        int input_token = -1;
+        int expected_top_token = -1;
+        std::vector<float> activations;
+        std::vector<float> expected_logits;
+        std::vector<float> expected_hidden;
+        std::vector<float> expected_final_hidden;
+    };
+
     int draft_input_pos = 0;
     int active_len = 0;
     int max_seq_len = 0;
@@ -839,6 +851,7 @@ struct oracle_fixture {
     std::vector<int8_t> v13;
     std::vector<int8_t> v14;
     mtp_trace_output expected;
+    std::vector<chain_step> chain;
 };
 
 static std::vector<uint32_t> read_u32_file(const fs::path & path) {
@@ -891,6 +904,21 @@ static oracle_fixture load_mtp_oracle_fixture(const fs::path & dir) {
         out.ff_out_norm = read_f32_file(dir / layer.at("ff_out_norm").at("file").get<std::string>());
         out.hidden_after_ff = read_f32_file(dir / layer.at("hidden_after_ff").at("file").get<std::string>());
         fx.expected.layers.push_back(std::move(out));
+    }
+    if (cfg.contains("chain") && cfg.at("chain").contains("teacher_forced_steps")) {
+        for (const auto & step : cfg.at("chain").at("teacher_forced_steps")) {
+            oracle_fixture::chain_step out;
+            out.step_index = step.at("step_index").get<int>();
+            out.input_pos = step.at("input_pos").get<int>();
+            out.active_len = step.at("active_len").get<int>();
+            out.input_token = step.at("input_token").get<int>();
+            out.expected_top_token = step.at("expected_top_token").get<int>();
+            out.activations = read_f32_file(dir / step.at("activations").at("file").get<std::string>());
+            out.expected_logits = read_f32_file(dir / step.at("expected_logits").at("file").get<std::string>());
+            out.expected_hidden = read_f32_file(dir / step.at("expected_hidden").at("file").get<std::string>());
+            out.expected_final_hidden = read_f32_file(dir / step.at("expected_final_hidden").at("file").get<std::string>());
+            fx.chain.push_back(std::move(out));
+        }
     }
     return fx;
 }
@@ -1477,6 +1505,27 @@ int main(int argc, char ** argv) {
                     {"hidden_after_ff_padded", compare_vec(exp.hidden_after_ff, pad.hidden_after_ff)},
                 });
             }
+            json chain_reports = json::array();
+            for (const auto & step : fx.chain) {
+                oracle_fixture step_fx = fx;
+                step_fx.draft_input_pos = step.input_pos;
+                step_fx.active_len = step.active_len;
+                step_fx.good_token = step.input_token;
+                step_fx.activations = step.activations;
+                auto got = run_mtp_step_padded_traced(*mtp, step_fx);
+                chain_reports.push_back({
+                    {"step_index", step.step_index},
+                    {"input_pos", step.input_pos},
+                    {"active_len", step.active_len},
+                    {"input_token", step.input_token},
+                    {"expected_top_token", step.expected_top_token},
+                    {"actual_top_token", got.token},
+                    {"top1_match", got.token == step.expected_top_token},
+                    {"logits", compare_vec(step.expected_logits, got.logits)},
+                    {"hidden", compare_vec(step.expected_hidden, got.hidden)},
+                    {"final_hidden", compare_vec(step.expected_final_hidden, got.final_hidden)},
+                });
+            }
             json report = {
                 {"mode", "offline_fixture_compare"},
                 {"fixture_dir", *fixture_dir},
@@ -1495,6 +1544,7 @@ int main(int argc, char ** argv) {
                     {"final_hidden", compare_vec(fx.expected.final_hidden, padded.final_hidden)},
                 }},
                 {"layers", layer_reports},
+                {"chain_teacher_forced", chain_reports},
             };
             if (report_path) {
                 std::ofstream out(*report_path);
