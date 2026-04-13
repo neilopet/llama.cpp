@@ -856,6 +856,22 @@ struct external_tree_result {
     double draft_mtp_s = 0.0;
 };
 
+struct external_tree_level_candidate {
+    llama_token token = 0;
+    float score = 0.0f;
+    float mtp_logprob = 0.0f;
+    float base_logprob = 0.0f;
+};
+
+struct external_tree_level_result {
+    bool expects_seed = false;
+    uint32_t depth = 0;
+    std::vector<external_tree_level_candidate> candidates;
+    double wall_s = 0.0;
+    double draft_decode_s = 0.0;
+    double draft_mtp_s = 0.0;
+};
+
 struct mtp_layer_trace {
     std::vector<float> hidden_in;
     std::vector<float> q_rope;
@@ -1591,6 +1607,14 @@ struct external_draft_backend {
         GGML_UNUSED(node_id);
         throw std::runtime_error("tree commit not supported by this draft backend");
     }
+    virtual external_tree_level_result preview_tree_level(int max_width) {
+        GGML_UNUSED(max_width);
+        throw std::runtime_error("tree level preview not supported by this draft backend");
+    }
+    virtual void commit_tree_token(llama_token token) {
+        GGML_UNUSED(token);
+        throw std::runtime_error("tree token commit not supported by this draft backend");
+    }
     virtual void discard_preview() {}
     virtual external_draft_result draft_plain(int max_tokens) {
         return draft(max_tokens);
@@ -1777,6 +1801,22 @@ struct sgd_tree_stats {
     uint64_t draft_mtp_ns = 0;
 };
 
+struct sgd_tree_level_candidate {
+    uint32_t token = 0;
+    float score = 0.0f;
+    float mtp_logprob = 0.0f;
+    float base_logprob = 0.0f;
+};
+
+struct sgd_tree_level_stats {
+    bool expects_seed = false;
+    uint64_t returned_candidates = 0;
+    uint64_t depth = 0;
+    uint64_t draft_build_ns = 0;
+    uint64_t draft_decode_ns = 0;
+    uint64_t draft_mtp_ns = 0;
+};
+
 struct litert_draft_ffi final : external_draft_backend {
     void * lib_handle = nullptr;
     SgdEngine * engine = nullptr;
@@ -1791,6 +1831,8 @@ struct litert_draft_ffi final : external_draft_backend {
     using sgd_session_accept_fn = int (*)(SgdSession *, const uint32_t *, size_t);
     using sgd_session_preview_tree_fn = int (*)(SgdSession *, size_t, size_t, sgd_tree_node *, size_t, size_t *, sgd_tree_stats *);
     using sgd_session_commit_tree_node_fn = int (*)(SgdSession *, uint32_t);
+    using sgd_session_preview_tree_level_fn = int (*)(SgdSession *, size_t, sgd_tree_level_candidate *, size_t, size_t *, sgd_tree_level_stats *);
+    using sgd_session_commit_tree_token_fn = int (*)(SgdSession *, uint32_t);
     using sgd_session_discard_preview_fn = int (*)(SgdSession *);
     using sgd_last_error_copy_fn = size_t (*)(char *, size_t);
 
@@ -1802,6 +1844,8 @@ struct litert_draft_ffi final : external_draft_backend {
     sgd_session_accept_fn session_accept = nullptr;
     sgd_session_preview_tree_fn session_preview_tree = nullptr;
     sgd_session_commit_tree_node_fn session_commit_tree_node = nullptr;
+    sgd_session_preview_tree_level_fn session_preview_tree_level = nullptr;
+    sgd_session_commit_tree_token_fn session_commit_tree_token = nullptr;
     sgd_session_discard_preview_fn session_discard_preview = nullptr;
     sgd_last_error_copy_fn last_error_copy = nullptr;
 
@@ -1827,6 +1871,8 @@ struct litert_draft_ffi final : external_draft_backend {
         session_accept = load_symbol<sgd_session_accept_fn>("sgd_session_accept");
         session_preview_tree = load_symbol<sgd_session_preview_tree_fn>("sgd_session_preview_tree");
         session_commit_tree_node = load_symbol<sgd_session_commit_tree_node_fn>("sgd_session_commit_tree_node");
+        session_preview_tree_level = load_symbol<sgd_session_preview_tree_level_fn>("sgd_session_preview_tree_level");
+        session_commit_tree_token = load_symbol<sgd_session_commit_tree_token_fn>("sgd_session_commit_tree_token");
         session_discard_preview = load_symbol<sgd_session_discard_preview_fn>("sgd_session_discard_preview");
         last_error_copy = load_symbol<sgd_last_error_copy_fn>("sgd_last_error_copy");
 
@@ -1955,6 +2001,48 @@ struct litert_draft_ffi final : external_draft_backend {
             throw std::runtime_error("ffi tree commit requested before init");
         }
         check(session_commit_tree_node(session, node_id), "sgd_session_commit_tree_node");
+    }
+
+    external_tree_level_result preview_tree_level(int max_width) override {
+        if (!session) {
+            throw std::runtime_error("ffi tree level preview requested before init");
+        }
+        external_tree_level_result out;
+        std::vector<sgd_tree_level_candidate> candidates((size_t) std::max(1, max_width));
+        size_t out_len = 0;
+        sgd_tree_level_stats stats{};
+        const auto t0 = std::chrono::steady_clock::now();
+        check(session_preview_tree_level(
+                session,
+                (size_t) std::max(1, max_width),
+                candidates.data(),
+                candidates.size(),
+                &out_len,
+                &stats),
+            "sgd_session_preview_tree_level");
+        out.wall_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        out.expects_seed = stats.expects_seed;
+        out.depth = (uint32_t) stats.depth;
+        out.draft_decode_s = (double) stats.draft_decode_ns / 1e9;
+        out.draft_mtp_s = (double) stats.draft_mtp_ns / 1e9;
+        candidates.resize(out_len);
+        out.candidates.reserve(candidates.size());
+        for (const auto & candidate : candidates) {
+            out.candidates.push_back(external_tree_level_candidate{
+                (llama_token) candidate.token,
+                candidate.score,
+                candidate.mtp_logprob,
+                candidate.base_logprob,
+            });
+        }
+        return out;
+    }
+
+    void commit_tree_token(llama_token token) override {
+        if (!session) {
+            throw std::runtime_error("ffi tree token commit requested before init");
+        }
+        check(session_commit_tree_token(session, (uint32_t) token), "sgd_session_commit_tree_token");
     }
 
     void discard_preview() override {
@@ -2749,64 +2837,137 @@ int main(int argc, char ** argv) {
                     if (!external_draft->supports_tree()) {
                         throw std::runtime_error("tree_mtp requires a tree-capable draft backend");
                     }
-                    const auto t_tree0 = std::chrono::steady_clock::now();
-                    external_tree_result tree = external_draft->preview_tree(tree_width, tree_depth);
-                    metrics.draft_build_s += std::chrono::duration<double>(std::chrono::steady_clock::now() - t_tree0).count();
-                    metrics.draft_decode_s += tree.draft_decode_s;
-                    metrics.draft_mtp_s += tree.draft_mtp_s;
-                    metrics.transport_s += std::max(0.0, tree.wall_s - tree.draft_decode_s - tree.draft_mtp_s);
-                    metrics.tree_nodes += (int) tree.nodes.size();
-                    metrics.proposed_tokens += 1 + (int) tree.nodes.size();
+                    bool chunk_full_match = true;
+                    bool chunk_done = false;
+                    int tree_committed = 0;
 
-                    const auto t_verify0 = std::chrono::steady_clock::now();
-                    verify_result tree_vr = verify_tree_prefix(ctx_tgt, n_past_tgt, tree.seed_token, tree.nodes, vocab_tgt);
-                    metrics.verify_s += std::chrono::duration<double>(std::chrono::steady_clock::now() - t_verify0).count();
-                    accepted = tree_vr.accepted;
-                    metrics.accepted_tokens += (int) tree_vr.accepted.size();
-                    metrics.accepted_from_draft += tree_vr.accepted_from_draft;
-                    metrics.verifier_substitutions += (int) tree_vr.accepted.size() - tree_vr.accepted_from_draft;
-                    metrics.first_token_mismatches += tree_vr.first_token_mismatch ? 1 : 0;
-                    metrics.full_match_chunks += tree_vr.full_match ? 1 : 0;
-                    metrics.tree_prefix_tokens += tree_vr.accepted_from_draft;
+                    const auto t_seed0 = std::chrono::steady_clock::now();
+                    external_tree_level_result seed_level = external_draft->preview_tree_level(tree_width);
+                    metrics.draft_build_s += std::chrono::duration<double>(std::chrono::steady_clock::now() - t_seed0).count();
+                    metrics.draft_decode_s += seed_level.draft_decode_s;
+                    metrics.draft_mtp_s += seed_level.draft_mtp_s;
+                    metrics.transport_s += std::max(0.0, seed_level.wall_s - seed_level.draft_decode_s - seed_level.draft_mtp_s);
+                    metrics.tree_nodes += (int) seed_level.candidates.size();
+                    metrics.proposed_tokens += (int) seed_level.candidates.size();
+                    if (!seed_level.expects_seed || seed_level.candidates.size() != 1) {
+                        throw std::runtime_error("tree_mtp seed level must return exactly one seed candidate");
+                    }
 
-                    const auto t_sync0 = std::chrono::steady_clock::now();
-                    if (tree_vr.first_token_mismatch) {
-                        external_draft->discard_preview();
-                        external_draft->accept(tree_vr.accepted);
-                        n_past_dft += (int) tree_vr.accepted.size();
-                    } else {
-                        external_draft->commit_tree_node(tree_vr.selected_tree_node_id);
-                        n_past_dft += tree_vr.accepted_from_draft;
+                    {
+                        const llama_token predicted = argmax_logits_skip_eog(
+                                vocab_tgt,
+                                llama_get_logits_ith(ctx_tgt, -1),
+                                llama_vocab_n_tokens(vocab_tgt));
+                        const llama_token seed_token = seed_level.candidates.front().token;
+                        if (predicted != seed_token) {
+                            accepted.push_back(predicted);
+                            metrics.accepted_tokens += 1;
+                            metrics.verifier_substitutions += 1;
+                            metrics.first_token_mismatches += 1;
+                            chunk_full_match = false;
+                            decode_tokens(ctx_tgt, accepted, n_past_tgt, false);
+                            const auto t_sync0 = std::chrono::steady_clock::now();
+                            external_draft->accept({ predicted });
+                            metrics.draft_sync_s += std::chrono::duration<double>(std::chrono::steady_clock::now() - t_sync0).count();
+                            n_past_dft += 1;
+                            chunk_done = true;
+                        } else {
+                            const auto t_sync0 = std::chrono::steady_clock::now();
+                            external_draft->commit_tree_token(predicted);
+                            metrics.draft_sync_s += std::chrono::duration<double>(std::chrono::steady_clock::now() - t_sync0).count();
+                            accepted.push_back(predicted);
+                            metrics.accepted_tokens += 1;
+                            metrics.accepted_from_draft += 1;
+                            metrics.tree_prefix_tokens += 1;
+                            tree_committed += 1;
+                            n_past_dft += 1;
+                            decode_tokens(ctx_tgt, { predicted }, n_past_tgt, false);
+                        }
+                    }
 
-                        if (tree_plain_tail > 0 && tree_vr.accepted_from_draft > 0 && tree_vr.accepted_from_draft < draft_max) {
-                            const int tail_cap = std::min(tree_plain_tail, draft_max - tree_vr.accepted_from_draft);
-                            if (tail_cap > 0) {
-                                const auto t_tail0 = std::chrono::steady_clock::now();
-                                external_draft_result tail = external_draft->draft_plain(tail_cap);
-                                metrics.draft_build_s += std::chrono::duration<double>(std::chrono::steady_clock::now() - t_tail0).count();
-                                metrics.draft_decode_s += tail.draft_decode_s;
-                                metrics.draft_mtp_s += tail.draft_mtp_s;
-                                metrics.draft_self_verify_s += tail.draft_self_verify_s;
-                                metrics.transport_s += tail.transport_s;
-                                metrics.tail_tokens += (int) tail.tokens.size();
-                                metrics.proposed_tokens += (int) tail.tokens.size();
-                                if (!tail.tokens.empty()) {
-                                    const auto t_verify_tail0 = std::chrono::steady_clock::now();
-                                    verify_result tail_vr = verify_draft_chunk(ctx_tgt, n_past_tgt, tail.tokens, vocab_tgt);
-                                    metrics.verify_s += std::chrono::duration<double>(std::chrono::steady_clock::now() - t_verify_tail0).count();
-                                    metrics.accepted_tokens += (int) tail_vr.accepted.size();
-                                    metrics.accepted_from_draft += tail_vr.accepted_from_draft;
-                                    metrics.verifier_substitutions += (int) tail_vr.accepted.size() - tail_vr.accepted_from_draft;
-                                    metrics.first_token_mismatches += tail_vr.first_token_mismatch ? 1 : 0;
-                                    metrics.full_match_chunks += tail_vr.full_match ? 1 : 0;
-                                    accepted.insert(accepted.end(), tail_vr.accepted.begin(), tail_vr.accepted.end());
-                                    external_draft->accept(tail_vr.accepted);
-                                    n_past_dft += (int) tail_vr.accepted.size();
-                                }
+                    for (int depth = 0; !chunk_done && depth < tree_depth; ++depth) {
+                        const auto t_lvl0 = std::chrono::steady_clock::now();
+                        external_tree_level_result level = external_draft->preview_tree_level(tree_width);
+                        metrics.draft_build_s += std::chrono::duration<double>(std::chrono::steady_clock::now() - t_lvl0).count();
+                        metrics.draft_decode_s += level.draft_decode_s;
+                        metrics.draft_mtp_s += level.draft_mtp_s;
+                        metrics.transport_s += std::max(0.0, level.wall_s - level.draft_decode_s - level.draft_mtp_s);
+                        metrics.tree_nodes += (int) level.candidates.size();
+                        metrics.proposed_tokens += (int) level.candidates.size();
+                        if (level.expects_seed) {
+                            throw std::runtime_error("tree_mtp returned a seed level after seed commit");
+                        }
+                        if (level.candidates.empty()) {
+                            break;
+                        }
+
+                        const llama_token predicted = argmax_logits_skip_eog(
+                                vocab_tgt,
+                                llama_get_logits_ith(ctx_tgt, -1),
+                                llama_vocab_n_tokens(vocab_tgt));
+                        const auto match_it = std::find_if(
+                                level.candidates.begin(),
+                                level.candidates.end(),
+                                [predicted](const external_tree_level_candidate & candidate) {
+                                    return candidate.token == predicted;
+                                });
+                        if (match_it == level.candidates.end()) {
+                            accepted.push_back(predicted);
+                            metrics.accepted_tokens += 1;
+                            metrics.verifier_substitutions += 1;
+                            chunk_full_match = false;
+                            decode_tokens(ctx_tgt, { predicted }, n_past_tgt, false);
+                            const auto t_sync0 = std::chrono::steady_clock::now();
+                            external_draft->accept({ predicted });
+                            metrics.draft_sync_s += std::chrono::duration<double>(std::chrono::steady_clock::now() - t_sync0).count();
+                            n_past_dft += 1;
+                            chunk_done = true;
+                            break;
+                        }
+
+                        const auto t_sync0 = std::chrono::steady_clock::now();
+                        external_draft->commit_tree_token(predicted);
+                        metrics.draft_sync_s += std::chrono::duration<double>(std::chrono::steady_clock::now() - t_sync0).count();
+                        accepted.push_back(predicted);
+                        metrics.accepted_tokens += 1;
+                        metrics.accepted_from_draft += 1;
+                        metrics.tree_prefix_tokens += 1;
+                        tree_committed += 1;
+                        n_past_dft += 1;
+                        decode_tokens(ctx_tgt, { predicted }, n_past_tgt, false);
+                    }
+
+                    if (!chunk_done && tree_plain_tail > 0 && tree_committed > 0 && tree_committed < draft_max) {
+                        const int tail_cap = std::min(tree_plain_tail, draft_max - tree_committed);
+                        if (tail_cap > 0) {
+                            const auto t_tail0 = std::chrono::steady_clock::now();
+                            external_draft_result tail = external_draft->draft_plain(tail_cap);
+                            metrics.draft_build_s += std::chrono::duration<double>(std::chrono::steady_clock::now() - t_tail0).count();
+                            metrics.draft_decode_s += tail.draft_decode_s;
+                            metrics.draft_mtp_s += tail.draft_mtp_s;
+                            metrics.draft_self_verify_s += tail.draft_self_verify_s;
+                            metrics.transport_s += tail.transport_s;
+                            metrics.tail_tokens += (int) tail.tokens.size();
+                            metrics.proposed_tokens += (int) tail.tokens.size();
+                            if (!tail.tokens.empty()) {
+                                const auto t_verify_tail0 = std::chrono::steady_clock::now();
+                                verify_result tail_vr = verify_draft_chunk(ctx_tgt, n_past_tgt, tail.tokens, vocab_tgt);
+                                metrics.verify_s += std::chrono::duration<double>(std::chrono::steady_clock::now() - t_verify_tail0).count();
+                                metrics.accepted_tokens += (int) tail_vr.accepted.size();
+                                metrics.accepted_from_draft += tail_vr.accepted_from_draft;
+                                metrics.verifier_substitutions += (int) tail_vr.accepted.size() - tail_vr.accepted_from_draft;
+                                metrics.first_token_mismatches += tail_vr.first_token_mismatch ? 1 : 0;
+                                chunk_full_match = chunk_full_match && tail_vr.full_match;
+                                accepted.insert(accepted.end(), tail_vr.accepted.begin(), tail_vr.accepted.end());
+                                const auto t_sync0 = std::chrono::steady_clock::now();
+                                external_draft->accept(tail_vr.accepted);
+                                metrics.draft_sync_s += std::chrono::duration<double>(std::chrono::steady_clock::now() - t_sync0).count();
+                                n_past_dft += (int) tail_vr.accepted.size();
                             }
                         }
                     }
-                    metrics.draft_sync_s += std::chrono::duration<double>(std::chrono::steady_clock::now() - t_sync0).count();
+
+                    metrics.full_match_chunks += chunk_full_match ? 1 : 0;
                 } else {
                     std::vector<llama_token> draft;
                     const auto t_draft0 = std::chrono::steady_clock::now();
