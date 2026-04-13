@@ -100,6 +100,8 @@ def summarize_runs(runs):
         "tree_nodes",
         "tree_prefix_tokens",
         "tail_tokens",
+        "generation_wall_s",
+        "decode_tok_s",
         "avg_proposed_per_chunk",
         "avg_accepted_per_chunk",
         "emitted_per_chunk",

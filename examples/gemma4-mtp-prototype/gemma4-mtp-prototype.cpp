@@ -2733,6 +2733,7 @@ int main(int argc, char ** argv) {
         const int n_predict_max = params.n_predict < 0 ? 256 : params.n_predict;
         int n_predict = 0;
         std::string generated_text;
+        const auto t_run0 = std::chrono::steady_clock::now();
 
         while (n_predict < n_predict_max) {
             metrics.chunks += 1;
@@ -2881,6 +2882,7 @@ int main(int argc, char ** argv) {
 
         done:
         LOG("\n\n");
+        const double generation_wall_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_run0).count();
         if (report_path) {
             json report = {
                 {"draft_only", metrics.draft_only},
@@ -2914,6 +2916,8 @@ int main(int argc, char ** argv) {
                 {"tree_nodes", metrics.tree_nodes},
                 {"tree_prefix_tokens", metrics.tree_prefix_tokens},
                 {"tail_tokens", metrics.tail_tokens},
+                {"generation_wall_s", generation_wall_s},
+                {"decode_tok_s", generation_wall_s > 0.0 ? (double) metrics.emitted_tokens / generation_wall_s : 0.0},
                 {"acceptance_rate", metrics.proposed_tokens > 0 ? (double) metrics.accepted_from_draft / (double) metrics.proposed_tokens : 0.0},
                 {"avg_proposed_per_chunk", metrics.chunks > 0 ? (double) metrics.proposed_tokens / (double) metrics.chunks : 0.0},
                 {"avg_accepted_per_chunk", metrics.chunks > 0 ? (double) metrics.accepted_from_draft / (double) metrics.chunks : 0.0},
