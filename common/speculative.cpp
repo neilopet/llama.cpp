@@ -10,6 +10,7 @@
 #include "sampling.h"
 
 #include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
@@ -119,8 +120,24 @@ static std::optional<std::string> env_str_nonempty(const char * name) {
     return std::string(value);
 }
 
+static std::string ascii_lower(std::string value) {
+    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char ch) {
+        return (char) std::tolower(ch);
+    });
+    return value;
+}
+
 static bool gemma_external_draft_enabled() {
     return env_str_nonempty("LLAMA_GEMMA4_DRAFT_FFI_LIB").has_value();
+}
+
+static bool gemma_external_tree_enabled() {
+    const auto value = env_str_nonempty("LLAMA_GEMMA4_DRAFT_TREE");
+    if (!value.has_value()) {
+        return false;
+    }
+    const std::string lower = ascii_lower(value.value());
+    return lower == "1" || lower == "true" || lower == "yes" || lower == "on";
 }
 
 struct gemma_external_draft_backend {
@@ -138,12 +155,30 @@ struct gemma_external_draft_backend {
         uint64_t mtp_extra_accepted = 0;
     };
 
+    struct sgd_tree_level_candidate {
+        uint32_t token = 0;
+        float score = 0.0f;
+        float mtp_logprob = 0.0f;
+        float base_logprob = 0.0f;
+    };
+
+    struct sgd_tree_level_stats {
+        bool expects_seed = false;
+        uint64_t returned_candidates = 0;
+        uint64_t depth = 0;
+        uint64_t draft_build_ns = 0;
+        uint64_t draft_decode_ns = 0;
+        uint64_t draft_mtp_ns = 0;
+    };
+
     using sgd_engine_open_fn = int (*)(const char *, SgdEngine **);
     using sgd_engine_close_fn = int (*)(SgdEngine *);
     using sgd_session_open_fn = int (*)(SgdEngine *, const uint32_t *, size_t, SgdSession **);
     using sgd_session_close_fn = int (*)(SgdSession *);
     using sgd_session_draft_fn = int (*)(SgdSession *, int, size_t, uint32_t *, size_t, size_t *, sgd_draft_stats *);
     using sgd_session_accept_fn = int (*)(SgdSession *, const uint32_t *, size_t);
+    using sgd_session_preview_tree_level_fn = int (*)(SgdSession *, size_t, sgd_tree_level_candidate *, size_t, size_t *, sgd_tree_level_stats *);
+    using sgd_session_commit_tree_token_fn = int (*)(SgdSession *, uint32_t);
     using sgd_session_discard_preview_fn = int (*)(SgdSession *);
     using sgd_last_error_copy_fn = size_t (*)(char *, size_t);
 
@@ -158,6 +193,8 @@ struct gemma_external_draft_backend {
     sgd_session_close_fn session_close = nullptr;
     sgd_session_draft_fn session_draft = nullptr;
     sgd_session_accept_fn session_accept = nullptr;
+    sgd_session_preview_tree_level_fn session_preview_tree_level = nullptr;
+    sgd_session_commit_tree_token_fn session_commit_tree_token = nullptr;
     sgd_session_discard_preview_fn session_discard_preview = nullptr;
     sgd_last_error_copy_fn last_error_copy = nullptr;
 
@@ -215,6 +252,8 @@ struct gemma_external_draft_backend {
         session_close = load_symbol<sgd_session_close_fn>("sgd_session_close");
         session_draft = load_symbol<sgd_session_draft_fn>("sgd_session_draft");
         session_accept = load_symbol<sgd_session_accept_fn>("sgd_session_accept");
+        session_preview_tree_level = load_symbol<sgd_session_preview_tree_level_fn>("sgd_session_preview_tree_level");
+        session_commit_tree_token = load_symbol<sgd_session_commit_tree_token_fn>("sgd_session_commit_tree_token");
         session_discard_preview = load_symbol<sgd_session_discard_preview_fn>("sgd_session_discard_preview");
         last_error_copy = load_symbol<sgd_last_error_copy_fn>("sgd_last_error_copy");
 
@@ -271,6 +310,54 @@ struct gemma_external_draft_backend {
         }
         check(session_discard_preview(session), "sgd_session_discard_preview");
     }
+
+    bool supports_tree() const {
+        return session_preview_tree_level != nullptr && session_commit_tree_token != nullptr;
+    }
+
+    common_speculative_tree_level preview_tree_level(int max_width) {
+        if (session == nullptr) {
+            throw std::runtime_error("draft session is not initialized");
+        }
+        std::vector<sgd_tree_level_candidate> candidates((size_t) std::max(1, max_width));
+        size_t out_len = 0;
+        sgd_tree_level_stats stats{};
+        check(session_preview_tree_level(session, (size_t) std::max(1, max_width), candidates.data(), candidates.size(), &out_len, &stats), "sgd_session_preview_tree_level");
+        candidates.resize(out_len);
+
+        common_speculative_tree_level out;
+        out.expects_seed = stats.expects_seed;
+        out.depth = (uint32_t) stats.depth;
+        out.candidates.reserve(candidates.size());
+        for (const auto & candidate : candidates) {
+            out.candidates.push_back(common_speculative_tree_candidate{
+                (llama_token) candidate.token,
+                candidate.score,
+                candidate.mtp_logprob,
+                candidate.base_logprob,
+            });
+        }
+        return out;
+    }
+
+    void commit_tree_token(llama_token token) {
+        if (session == nullptr) {
+            throw std::runtime_error("draft session is not initialized");
+        }
+        check(session_commit_tree_token(session, (uint32_t) token), "sgd_session_commit_tree_token");
+    }
+
+    llama_tokens draft_plain(int max_tokens) {
+        if (session == nullptr) {
+            throw std::runtime_error("draft session is not initialized");
+        }
+        std::vector<uint32_t> tokens((size_t) std::max(0, max_tokens));
+        size_t out_len = 0;
+        sgd_draft_stats stats{};
+        check(session_draft(session, 0, (size_t) std::max(0, max_tokens), tokens.data(), tokens.size(), &out_len, &stats), "sgd_session_draft");
+        tokens.resize(out_len);
+        return llama_tokens(tokens.begin(), tokens.end());
+    }
 };
 
 // state of an implementation of speculative decoding
@@ -314,7 +401,24 @@ struct common_speculative_state {
     }
 
     virtual void accept(uint16_t n_accepted) = 0;
+    virtual void accept_committed(const llama_tokens & committed_tokens) {
+        accept_tokens(committed_tokens, committed_tokens.size());
+    }
     virtual void discard() {}
+    virtual bool supports_tree() const { return false; }
+    virtual common_speculative_tree_level preview_tree_level(int max_width) {
+        GGML_UNUSED(max_width);
+        throw std::runtime_error("tree preview not supported by this speculative backend");
+    }
+    virtual void commit_tree_token(llama_token token) {
+        GGML_UNUSED(token);
+        throw std::runtime_error("tree commit not supported by this speculative backend");
+    }
+    virtual void draft_plain(int max_tokens, llama_tokens & result) {
+        GGML_UNUSED(max_tokens);
+        GGML_UNUSED(result);
+        throw std::runtime_error("plain draft override not supported by this speculative backend");
+    }
 };
 
 struct common_speculative_state_draft : public common_speculative_state {
@@ -642,11 +746,53 @@ struct common_speculative_state_draft : public common_speculative_state {
         accept(n_accepted);
     }
 
+    void accept_committed(const llama_tokens & committed_tokens) override {
+        if (ext_draft) {
+            if (!committed_tokens.empty()) {
+                ext_draft->accept(committed_tokens);
+                prompt_dft.insert(prompt_dft.end(), committed_tokens.begin(), committed_tokens.end());
+            }
+            ext_pending_seed.reset();
+            return;
+        }
+        accept_tokens(committed_tokens, committed_tokens.size());
+    }
+
     void discard() override {
         if (ext_draft) {
             ext_draft->discard_preview();
             ext_pending_seed.reset();
         }
+    }
+
+    bool supports_tree() const override {
+        return ext_draft && gemma_external_tree_enabled() && ext_draft->supports_tree();
+    }
+
+    common_speculative_tree_level preview_tree_level(int max_width) override {
+        if (!supports_tree()) {
+            return common_speculative_state::preview_tree_level(max_width);
+        }
+        return ext_draft->preview_tree_level(max_width);
+    }
+
+    void commit_tree_token(llama_token token) override {
+        if (!supports_tree()) {
+            common_speculative_state::commit_tree_token(token);
+            return;
+        }
+        ext_draft->commit_tree_token(token);
+        prompt_dft.push_back(token);
+        ext_pending_seed.reset();
+    }
+
+    void draft_plain(int max_tokens, llama_tokens & result) override {
+        if (!ext_draft) {
+            common_speculative_state::draft_plain(max_tokens, result);
+            return;
+        }
+        ext_pending_seed.reset();
+        result = ext_draft->draft_plain(max_tokens);
     }
 
     std::string replace_to_dft(const std::string & input) const {
@@ -1296,11 +1442,93 @@ void common_speculative_accept_tokens(common_speculative * spec, const llama_tok
     }
 }
 
+void common_speculative_accept_committed(common_speculative * spec, const llama_tokens & committed_tokens) {
+    if (spec == nullptr || committed_tokens.empty()) {
+        return;
+    }
+
+    common_speculative_state * impl = spec->curr_impl;
+
+    GGML_ASSERT(impl);
+
+    {
+        common_time_meas tm(impl->t_accept_us, !impl->gen_perf);
+        impl->n_acc_drafts++;
+        impl->n_acc_tokens += committed_tokens.size();
+        impl->accept_committed(committed_tokens);
+        impl->n_call_accept++;
+    }
+}
+
 void common_speculative_discard(common_speculative * spec) {
     if (spec == nullptr || spec->curr_impl == nullptr) {
         return;
     }
     spec->curr_impl->discard();
+}
+
+static common_speculative_state * common_speculative_find_tree_impl(common_speculative * spec) {
+    if (spec == nullptr) {
+        return nullptr;
+    }
+    if (spec->curr_impl && spec->curr_impl->supports_tree()) {
+        return spec->curr_impl;
+    }
+    for (auto & impl : spec->impls) {
+        if (impl->supports_tree()) {
+            return impl.get();
+        }
+    }
+    return nullptr;
+}
+
+bool common_speculative_supports_tree(common_speculative * spec) {
+    return common_speculative_find_tree_impl(spec) != nullptr;
+}
+
+common_speculative_tree_level common_speculative_preview_tree_level(common_speculative * spec, int max_width) {
+    auto * impl = common_speculative_find_tree_impl(spec);
+    if (impl == nullptr) {
+        throw std::runtime_error("tree speculative backend is not available");
+    }
+    spec->curr_impl = impl;
+    common_speculative_tree_level result;
+    {
+        common_time_meas tm(impl->t_draft_us, !impl->gen_perf);
+        result = impl->preview_tree_level(max_width);
+        impl->n_call_draft++;
+    }
+    impl->n_gen_drafts++;
+    impl->n_gen_tokens += result.candidates.size();
+    return result;
+}
+
+void common_speculative_commit_tree_token(common_speculative * spec, llama_token token) {
+    auto * impl = common_speculative_find_tree_impl(spec);
+    if (impl == nullptr) {
+        throw std::runtime_error("tree speculative backend is not available");
+    }
+    spec->curr_impl = impl;
+    impl->commit_tree_token(token);
+}
+
+llama_tokens common_speculative_draft_plain(common_speculative * spec, int max_tokens) {
+    auto * impl = common_speculative_find_tree_impl(spec);
+    if (impl == nullptr) {
+        throw std::runtime_error("tree speculative backend is not available");
+    }
+    spec->curr_impl = impl;
+    llama_tokens result;
+    {
+        common_time_meas tm(impl->t_draft_us, !impl->gen_perf);
+        impl->draft_plain(max_tokens, result);
+        impl->n_call_draft++;
+    }
+    if (!result.empty()) {
+        impl->n_gen_drafts++;
+        impl->n_gen_tokens += result.size();
+    }
+    return result;
 }
 
 void common_speculative_print_stats(const common_speculative * spec) {
