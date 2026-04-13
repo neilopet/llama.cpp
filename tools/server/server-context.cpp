@@ -597,6 +597,7 @@ private:
     llama_context * ctx = nullptr;
 
     llama_batch batch {};
+    llama_batch batch_tree {};
 
     llama_model_ptr model_dft;
 
@@ -640,6 +641,7 @@ private:
         }
 
         llama_batch_free(batch);
+        llama_batch_free(batch_tree);
     }
 
     void slot_save_and_clear(server_slot & slot) {
@@ -859,6 +861,7 @@ private:
         {
             const int32_t n_batch = llama_n_batch(ctx);
             batch = llama_batch_init(std::max(n_batch, params_base.n_parallel), 0, 1);
+            batch_tree = llama_batch_init(std::max(n_batch, params_base.n_parallel), 0, 1);
         }
 
         if (params_base.cache_ram_mib != 0) {
@@ -2770,17 +2773,222 @@ private:
             llama_set_embeddings(ctx, slot_batched->task->need_embd());
         }
 
-        if (batch.n_tokens == 0) {
-            SRV_WRN("%s", "no tokens to decode\n");
+        int32_t i_next = 0;
 
-            if (++n_empty_consecutive > 3) {
-                GGML_ABORT("fatal error - please provide logs and repro in %s\n", "https://github.com/ggml-org/llama.cpp/pull/20277");
+        auto run_tree_spec = [&]() {
+            // speculative decoding - lazy tree mode (sequential, unbatched)
+            for (auto & slot : slots) {
+                if (slot.state != SLOT_STATE_GENERATING || !can_use_tree_spec(slot)) {
+                    continue;
+                }
+                if (slot.get_n_draft_max() <= 0 || slot.i_batch_dft.size() > 0) {
+                    continue;
+                }
+
+                int slot_n_past = slot.prompt.tokens.pos_next();
+                auto decode_slot_tokens = [&](const llama_tokens & tokens, bool output_all) {
+                    if (tokens.empty()) {
+                        return;
+                    }
+                    common_batch_clear(batch_tree);
+                    for (size_t i = 0; i < tokens.size(); ++i) {
+                        const bool want_logits = output_all || (i + 1 == tokens.size());
+                        common_batch_add(batch_tree, tokens[i], slot_n_past + (int) i, { slot.id }, want_logits);
+                    }
+                    if (llama_decode(ctx, batch_tree) != 0) {
+                        throw std::runtime_error("llama_decode failed");
+                    }
+                    slot_n_past += (int) tokens.size();
+                };
+
+                auto sample_current = [&]() {
+                    const llama_token token = common_sampler_sample(slot.smpl.get(), ctx, -1);
+                    common_sampler_accept(slot.smpl.get(), token, true);
+                    return token;
+                };
+
+                const int n_draft_max = slot.get_n_draft_max();
+                const llama_token seed_token = slot.sampled;
+
+                llama_tokens ids;
+                int draft_count = 0;
+                int draft_accepted = 0;
+
+                const auto seed_level = common_speculative_preview_tree_level(slot.spec, tree_width);
+                if (!seed_level.expects_seed || seed_level.candidates.size() != 1) {
+                    send_error(slot, "invalid speculative tree seed level", ERROR_TYPE_SERVER);
+                    slot.release();
+                    continue;
+                }
+
+                decode_slot_tokens({ seed_token }, false);
+                slot.prompt.tokens.push_back(seed_token);
+
+                if (seed_level.candidates.front().token != seed_token) {
+                    common_speculative_discard(slot.spec);
+                    common_speculative_accept_committed(slot.spec, { seed_token });
+                    ids.push_back(sample_current());
+                } else {
+                    common_speculative_commit_tree_token(slot.spec, seed_token);
+
+                    bool stop_tree = false;
+                    for (int depth = 0; depth < tree_depth; ++depth) {
+                        const auto level = common_speculative_preview_tree_level(slot.spec, tree_width);
+                        if (level.expects_seed) {
+                            send_error(slot, "invalid speculative tree continuation level", ERROR_TYPE_SERVER);
+                            slot.release();
+                            stop_tree = true;
+                            break;
+                        }
+                        if (level.candidates.empty()) {
+                            break;
+                        }
+
+                        draft_count += (int) level.candidates.size();
+
+                        const llama_token predicted = sample_current();
+                        const auto match = std::find_if(
+                                level.candidates.begin(),
+                                level.candidates.end(),
+                                [predicted](const common_speculative_tree_candidate & candidate) {
+                                    return candidate.token == predicted;
+                                });
+
+                        if (match == level.candidates.end()) {
+                            common_speculative_discard(slot.spec);
+                            common_speculative_accept_committed(slot.spec, { predicted });
+                            ids.push_back(predicted);
+                            decode_slot_tokens({ predicted }, false);
+                            stop_tree = true;
+                            break;
+                        }
+
+                        common_speculative_commit_tree_token(slot.spec, predicted);
+                        ids.push_back(predicted);
+                        draft_accepted += 1;
+                        decode_slot_tokens({ predicted }, false);
+                    }
+
+                    bool used_tail = false;
+                    if (slot.state == SLOT_STATE_GENERATING && !stop_tree && tree_plain_tail > 0) {
+                        const int remaining = std::max(0, n_draft_max - (int) ids.size());
+                        const int tail_cap = std::min(tree_plain_tail, remaining);
+                        if (tail_cap > 0) {
+                            llama_tokens draft_tail = common_speculative_draft_plain(slot.spec, tail_cap);
+                            if ((int) draft_tail.size() < slot.task->params.speculative.n_min) {
+                                common_speculative_discard(slot.spec);
+                            } else if (!draft_tail.empty()) {
+                                draft_count += (int) draft_tail.size();
+                                const llama_token first_tail = sample_current();
+                                if (first_tail != draft_tail.front()) {
+                                    common_speculative_discard(slot.spec);
+                                    ids.push_back(first_tail);
+                                } else {
+                                    const int committed_n_past = slot_n_past;
+                                    decode_slot_tokens(draft_tail, true);
+                                    ids.push_back(first_tail);
+
+                                    if (draft_tail.size() == 1) {
+                                        draft_accepted += 1;
+                                        common_speculative_accept_committed(slot.spec, { first_tail });
+                                        slot_n_past = committed_n_past + 1;
+                                        ids.push_back(sample_current());
+                                    } else {
+                                        llama_tokens draft_suffix(draft_tail.begin() + 1, draft_tail.end());
+                                        std::vector<int> idxs(draft_tail.size());
+                                        for (size_t i = 0; i < idxs.size(); ++i) {
+                                            idxs[i] = (int) i;
+                                        }
+
+                                        const auto ids_suffix = common_sampler_sample_and_accept_n(slot.smpl.get(), ctx, idxs, draft_suffix);
+                                        size_t accepted_suffix = 0;
+                                        while (accepted_suffix < draft_suffix.size() &&
+                                               accepted_suffix < ids_suffix.size() &&
+                                               ids_suffix[accepted_suffix] == draft_suffix[accepted_suffix]) {
+                                            accepted_suffix++;
+                                        }
+
+                                        const size_t accepted_tail = 1 + accepted_suffix;
+                                        draft_accepted += (int) accepted_tail;
+                                        slot_n_past = committed_n_past + (int) accepted_tail;
+                                        llama_tokens committed_tail(draft_tail.begin(), draft_tail.begin() + (ptrdiff_t) accepted_tail);
+                                        common_speculative_accept_committed(slot.spec, committed_tail);
+                                        ids.insert(ids.end(), ids_suffix.begin(), ids_suffix.end());
+                                    }
+
+                                    llama_memory_seq_rm(llama_get_memory(ctx), slot.id, slot_n_past, -1);
+                                }
+                                used_tail = true;
+                            }
+                        }
+                    }
+
+                    if (slot.state == SLOT_STATE_GENERATING && !used_tail) {
+                        ids.push_back(sample_current());
+                    }
+                }
+
+                if (slot.state != SLOT_STATE_GENERATING || ids.empty()) {
+                    continue;
+                }
+
+                const int64_t t_current = ggml_time_us();
+                slot.n_decoded += ids.size();
+
+                if (slot.n_decoded == (int) ids.size()) {
+                    slot.t_start_generation = t_current;
+                    slot.t_prompt_processing = (slot.t_start_generation - slot.t_start_process_prompt) / 1e3;
+                    metrics.on_prompt_eval(slot);
+                }
+
+                slot.t_token_generation = std::max<int64_t>(1, t_current - slot.t_start_generation) / 1e3;
+                slot.n_draft_total += draft_count;
+                slot.n_draft_accepted += draft_accepted;
+
+                if (ids.size() > 1) {
+                    slot.prompt.tokens.insert({ ids.begin(), ids.end() - 1 });
+                }
+                slot.sampled = ids.back();
+
+                llama_memory_seq_rm(llama_get_memory(ctx), slot.id, slot.prompt.n_tokens(), -1);
+
+                for (size_t i = 0; i < ids.size(); ++i) {
+                    completion_token_output result;
+                    result.tok          = ids[i];
+                    result.text_to_send = common_token_to_piece(ctx, result.tok, accept_special_token(slot, result.tok));
+                    result.prob         = 1.0f;
+
+                    if (!process_token(result, slot)) {
+                        slot.print_timings();
+                        send_final_response(slot);
+                        metrics.on_prediction(slot);
+                        slot.release();
+                        break;
+                    }
+                }
+            }
+        };
+
+        const bool has_tree_work = std::any_of(slots.begin(), slots.end(), [&](server_slot & slot) {
+            return slot.state == SLOT_STATE_GENERATING &&
+                   can_use_tree_spec(slot) &&
+                   slot.get_n_draft_max() > 0 &&
+                   slot.i_batch_dft.empty();
+        });
+
+        if (batch.n_tokens == 0) {
+            if (has_tree_work) {
+                n_empty_consecutive = 0;
+            } else {
+                SRV_WRN("%s", "no tokens to decode\n");
+
+                if (++n_empty_consecutive > 3) {
+                    GGML_ABORT("fatal error - please provide logs and repro in %s\n", "https://github.com/ggml-org/llama.cpp/pull/20277");
+                }
             }
         } else {
             n_empty_consecutive = 0;
         }
-
-        int32_t i_next = 0;
 
         // process the created batch of tokens
         for (int32_t i = 0; i < batch.n_tokens; i = i_next) {
@@ -3019,193 +3227,9 @@ private:
                 SLT_DBG(slot, "accepted %d/%d draft tokens, new n_tokens = %d\n", (int) ids.size() - 1, (int) n_draft, slot.prompt.n_tokens());
             }
 
-            // speculative decoding - lazy tree mode (sequential, unbatched)
-            for (auto & slot : slots) {
-                if (slot.state != SLOT_STATE_GENERATING || !can_use_tree_spec(slot)) {
-                    continue;
-                }
-                if (slot.get_n_draft_max() <= 0 || slot.i_batch_dft.size() > 0) {
-                    continue;
-                }
-
-                int slot_n_past = slot.prompt.tokens.pos_next();
-                auto decode_slot_tokens = [&](const llama_tokens & tokens, bool output_all) {
-                    if (tokens.empty()) {
-                        return;
-                    }
-                    common_batch_clear(batch);
-                    for (size_t i = 0; i < tokens.size(); ++i) {
-                        const bool want_logits = output_all || (i + 1 == tokens.size());
-                        common_batch_add(batch, tokens[i], slot_n_past + (int) i, { slot.id }, want_logits);
-                    }
-                    if (llama_decode(ctx, batch) != 0) {
-                        throw std::runtime_error("llama_decode failed");
-                    }
-                    slot_n_past += (int) tokens.size();
-                };
-
-                auto sample_current = [&]() {
-                    const llama_token token = common_sampler_sample(slot.smpl.get(), ctx, -1);
-                    common_sampler_accept(slot.smpl.get(), token, true);
-                    return token;
-                };
-
-                const int n_draft_max = slot.get_n_draft_max();
-                const llama_token seed_token = slot.sampled;
-
-                llama_tokens ids;
-                int draft_count = 0;
-                int draft_accepted = 0;
-
-                const auto seed_level = common_speculative_preview_tree_level(slot.spec, tree_width);
-                if (!seed_level.expects_seed || seed_level.candidates.size() != 1) {
-                    send_error(slot, "invalid speculative tree seed level", ERROR_TYPE_SERVER);
-                    slot.release();
-                    continue;
-                }
-
-                decode_slot_tokens({ seed_token }, false);
-                slot.prompt.tokens.push_back(seed_token);
-
-                if (seed_level.candidates.front().token != seed_token) {
-                    common_speculative_discard(slot.spec);
-                    common_speculative_accept_committed(slot.spec, { seed_token });
-                    ids.push_back(sample_current());
-                } else {
-                    common_speculative_commit_tree_token(slot.spec, seed_token);
-
-                    bool stop_tree = false;
-                    for (int depth = 0; depth < tree_depth; ++depth) {
-                        const auto level = common_speculative_preview_tree_level(slot.spec, tree_width);
-                        if (level.expects_seed) {
-                            send_error(slot, "invalid speculative tree continuation level", ERROR_TYPE_SERVER);
-                            slot.release();
-                            stop_tree = true;
-                            break;
-                        }
-                        if (level.candidates.empty()) {
-                            break;
-                        }
-
-                        draft_count += (int) level.candidates.size();
-
-                        const llama_token predicted = sample_current();
-                        const auto match = std::find_if(
-                                level.candidates.begin(),
-                                level.candidates.end(),
-                                [predicted](const common_speculative_tree_candidate & candidate) {
-                                    return candidate.token == predicted;
-                                });
-
-                        if (match == level.candidates.end()) {
-                            common_speculative_discard(slot.spec);
-                            common_speculative_accept_committed(slot.spec, { predicted });
-                            ids.push_back(predicted);
-                            decode_slot_tokens({ predicted }, false);
-                            stop_tree = true;
-                            break;
-                        }
-
-                        common_speculative_commit_tree_token(slot.spec, predicted);
-                        ids.push_back(predicted);
-                        draft_accepted += 1;
-                        decode_slot_tokens({ predicted }, false);
-                    }
-
-                    bool used_tail = false;
-                    if (slot.state == SLOT_STATE_GENERATING && !stop_tree && tree_plain_tail > 0) {
-                        const int remaining = std::max(0, n_draft_max - (int) ids.size());
-                        const int tail_cap = std::min(tree_plain_tail, remaining);
-                        if (tail_cap > 0) {
-                            llama_tokens draft_tail = common_speculative_draft_plain(slot.spec, tail_cap);
-                            if ((int) draft_tail.size() < slot.task->params.speculative.n_min) {
-                                common_speculative_discard(slot.spec);
-                            } else if (!draft_tail.empty()) {
-                                draft_count += (int) draft_tail.size();
-                                const llama_token first_tail = sample_current();
-                                if (first_tail != draft_tail.front()) {
-                                    common_speculative_discard(slot.spec);
-                                    ids.push_back(first_tail);
-                                } else {
-                                    decode_slot_tokens(draft_tail, true);
-                                    ids.push_back(first_tail);
-
-                                    if (draft_tail.size() == 1) {
-                                        draft_accepted += 1;
-                                        common_speculative_accept_committed(slot.spec, { first_tail });
-                                        ids.push_back(sample_current());
-                                    } else {
-                                        llama_tokens draft_suffix(draft_tail.begin() + 1, draft_tail.end());
-                                        std::vector<int> idxs(draft_tail.size());
-                                        for (size_t i = 0; i < idxs.size(); ++i) {
-                                            idxs[i] = (int) i;
-                                        }
-
-                                        const auto ids_suffix = common_sampler_sample_and_accept_n(slot.smpl.get(), ctx, idxs, draft_suffix);
-                                        size_t accepted_suffix = 0;
-                                        while (accepted_suffix < draft_suffix.size() &&
-                                               accepted_suffix < ids_suffix.size() &&
-                                               ids_suffix[accepted_suffix] == draft_suffix[accepted_suffix]) {
-                                            accepted_suffix++;
-                                        }
-
-                                        const size_t accepted_tail = 1 + accepted_suffix;
-                                        draft_accepted += (int) accepted_tail;
-                                        llama_tokens committed_tail(draft_tail.begin(), draft_tail.begin() + (ptrdiff_t) accepted_tail);
-                                        common_speculative_accept_committed(slot.spec, committed_tail);
-                                        ids.insert(ids.end(), ids_suffix.begin(), ids_suffix.end());
-                                    }
-                                }
-                                used_tail = true;
-                            }
-                        }
-                    }
-
-                    if (slot.state == SLOT_STATE_GENERATING && !used_tail) {
-                        ids.push_back(sample_current());
-                    }
-                }
-
-                if (slot.state != SLOT_STATE_GENERATING || ids.empty()) {
-                    continue;
-                }
-
-                const int64_t t_current = ggml_time_us();
-                slot.n_decoded += ids.size();
-
-                if (slot.n_decoded == (int) ids.size()) {
-                    slot.t_start_generation = t_current;
-                    slot.t_prompt_processing = (slot.t_start_generation - slot.t_start_process_prompt) / 1e3;
-                    metrics.on_prompt_eval(slot);
-                }
-
-                slot.t_token_generation = std::max<int64_t>(1, t_current - slot.t_start_generation) / 1e3;
-                slot.n_draft_total += draft_count;
-                slot.n_draft_accepted += draft_accepted;
-
-                if (ids.size() > 1) {
-                    slot.prompt.tokens.insert({ ids.begin(), ids.end() - 1 });
-                }
-                slot.sampled = ids.back();
-
-                llama_memory_seq_rm(llama_get_memory(ctx), slot.id, slot.prompt.n_tokens(), -1);
-
-                for (size_t i = 0; i < ids.size(); ++i) {
-                    completion_token_output result;
-                    result.tok          = ids[i];
-                    result.text_to_send = common_token_to_piece(ctx, result.tok, accept_special_token(slot, result.tok));
-                    result.prob         = 1.0f;
-
-                    if (!process_token(result, slot)) {
-                        slot.print_timings();
-                        send_final_response(slot);
-                        metrics.on_prediction(slot);
-                        slot.release();
-                        break;
-                    }
-                }
-            }
         }
+
+        run_tree_spec();
 
         SRV_DBG("%s", "run slots completed\n");
     }
