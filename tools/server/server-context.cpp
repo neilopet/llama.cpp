@@ -2126,6 +2126,7 @@ private:
 
                 if (slot.task->params.speculative.n_min > (int) draft.size()) {
                     SLT_DBG(slot, "ignoring small draft: %d < %d\n", (int) draft.size(), slot.task->params.speculative.n_min);
+                    common_speculative_discard(slot.spec);
                     // fallback to normal decoding
                     slot.i_batch = slot.i_batch_dft[0];
                     slot.drafted.clear();
@@ -2928,7 +2929,7 @@ private:
                 slot.n_draft_accepted += ids.size() - 1;
 
                 // inform the speculative decoding about the number of accepted tokens
-                common_speculative_accept(slot.spec, ids.size() - 1);
+                common_speculative_accept_tokens(slot.spec, ids, ids.size() - 1);
 
                 // rollback to the state before sampling the draft tokens
                 slot.prompt.tokens.keep_first(slot.prompt.n_tokens() - n_draft);

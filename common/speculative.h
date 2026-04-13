@@ -36,6 +36,8 @@ llama_tokens common_speculative_draft(
 
 // informs the speculative decoder that n_accepted tokens were accepted by the target model
 void common_speculative_accept(common_speculative * spec, uint16_t n_accepted);
+void common_speculative_accept_tokens(common_speculative * spec, const llama_tokens & accepted_tokens, uint16_t n_accepted);
+void common_speculative_discard(common_speculative * spec);
 
 // print statistics about the speculative decoding
 void common_speculative_print_stats(const common_speculative * spec);

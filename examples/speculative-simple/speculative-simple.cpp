@@ -166,6 +166,7 @@ int main(int argc, char ** argv) {
         {
             // do not waste time on small drafts
             if (draft.size() < (size_t) params_spec.n_min) {
+                common_speculative_discard(spec);
                 draft.clear();
             }
 
@@ -195,6 +196,8 @@ int main(int argc, char ** argv) {
         n_drafted += draft.size(); // note: we ignore the discarded small drafts
         n_accept  += ids.size() - 1;
         n_predict += ids.size();
+
+        common_speculative_accept_tokens(spec, ids, ids.size() - 1);
 
         // process the accepted tokens and update contexts
         //

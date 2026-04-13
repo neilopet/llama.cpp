@@ -10,9 +10,14 @@
 #include "sampling.h"
 
 #include <algorithm>
+#include <chrono>
+#include <cstdlib>
 #include <cstring>
+#include <dlfcn.h>
 #include <iomanip>
 #include <map>
+#include <memory>
+#include <optional>
 
 #define SPEC_VOCAB_MAX_SIZE_DIFFERENCE  128
 #define SPEC_VOCAB_CHECK_START_TOKEN_ID 5
@@ -106,6 +111,168 @@ static bool common_speculative_are_compatible(
     return true;
 }
 
+static std::optional<std::string> env_str_nonempty(const char * name) {
+    const char * value = std::getenv(name);
+    if (value == nullptr || *value == '\0') {
+        return std::nullopt;
+    }
+    return std::string(value);
+}
+
+static bool gemma_external_draft_enabled() {
+    return env_str_nonempty("LLAMA_GEMMA4_DRAFT_FFI_LIB").has_value();
+}
+
+struct gemma_external_draft_backend {
+    struct SgdEngine;
+    struct SgdSession;
+
+    struct sgd_draft_stats {
+        uint64_t returned_tokens = 0;
+        int32_t next_pos = 0;
+        uint64_t draft_build_ns = 0;
+        uint64_t draft_decode_ns = 0;
+        uint64_t draft_mtp_ns = 0;
+        uint64_t draft_self_verify_ns = 0;
+        uint64_t mtp_extra_attempted = 0;
+        uint64_t mtp_extra_accepted = 0;
+    };
+
+    using sgd_engine_open_fn = int (*)(const char *, SgdEngine **);
+    using sgd_engine_close_fn = int (*)(SgdEngine *);
+    using sgd_session_open_fn = int (*)(SgdEngine *, const uint32_t *, size_t, SgdSession **);
+    using sgd_session_close_fn = int (*)(SgdSession *);
+    using sgd_session_draft_fn = int (*)(SgdSession *, int, size_t, uint32_t *, size_t, size_t *, sgd_draft_stats *);
+    using sgd_session_accept_fn = int (*)(SgdSession *, const uint32_t *, size_t);
+    using sgd_session_discard_preview_fn = int (*)(SgdSession *);
+    using sgd_last_error_copy_fn = size_t (*)(char *, size_t);
+
+    void * lib_handle = nullptr;
+    SgdEngine * engine = nullptr;
+    SgdSession * session = nullptr;
+    int mode = 0;
+
+    sgd_engine_open_fn engine_open = nullptr;
+    sgd_engine_close_fn engine_close = nullptr;
+    sgd_session_open_fn session_open = nullptr;
+    sgd_session_close_fn session_close = nullptr;
+    sgd_session_draft_fn session_draft = nullptr;
+    sgd_session_accept_fn session_accept = nullptr;
+    sgd_session_discard_preview_fn session_discard_preview = nullptr;
+    sgd_last_error_copy_fn last_error_copy = nullptr;
+
+    template <typename Fn>
+    Fn load_symbol(const char * name) {
+        dlerror();
+        void * sym = dlsym(lib_handle, name);
+        if (sym == nullptr) {
+            throw std::runtime_error(std::string("missing draft ffi symbol: ") + name);
+        }
+        return reinterpret_cast<Fn>(sym);
+    }
+
+    std::string last_error() const {
+        if (last_error_copy == nullptr) {
+            return "unknown ffi error";
+        }
+        size_t len = last_error_copy(nullptr, 0);
+        std::string out(len + 1, '\0');
+        last_error_copy(out.data(), out.size());
+        out.resize(std::strlen(out.c_str()));
+        return out;
+    }
+
+    void check(int rc, const char * name) const {
+        if (rc == 0) {
+            return;
+        }
+        throw std::runtime_error(std::string(name) + ": " + last_error());
+    }
+
+    gemma_external_draft_backend() {
+        const auto lib_path = env_str_nonempty("LLAMA_GEMMA4_DRAFT_FFI_LIB");
+        const auto manifest = env_str_nonempty("LLAMA_GEMMA4_DRAFT_MANIFEST");
+        if (!lib_path || !manifest) {
+            throw std::runtime_error("LLAMA_GEMMA4_DRAFT_FFI_LIB and LLAMA_GEMMA4_DRAFT_MANIFEST must be set");
+        }
+        const std::string mode_name = env_str_nonempty("LLAMA_GEMMA4_DRAFT_MODE").value_or("plain");
+        if (mode_name == "plain") {
+            mode = 0;
+        } else if (mode_name == "mtp") {
+            mode = 1;
+        } else {
+            throw std::runtime_error("LLAMA_GEMMA4_DRAFT_MODE must be plain or mtp");
+        }
+
+        lib_handle = dlopen(lib_path->c_str(), RTLD_NOW | RTLD_LOCAL);
+        if (!lib_handle) {
+            throw std::runtime_error("failed to dlopen draft ffi library: " + *lib_path);
+        }
+
+        engine_open = load_symbol<sgd_engine_open_fn>("sgd_engine_open");
+        engine_close = load_symbol<sgd_engine_close_fn>("sgd_engine_close");
+        session_open = load_symbol<sgd_session_open_fn>("sgd_session_open");
+        session_close = load_symbol<sgd_session_close_fn>("sgd_session_close");
+        session_draft = load_symbol<sgd_session_draft_fn>("sgd_session_draft");
+        session_accept = load_symbol<sgd_session_accept_fn>("sgd_session_accept");
+        session_discard_preview = load_symbol<sgd_session_discard_preview_fn>("sgd_session_discard_preview");
+        last_error_copy = load_symbol<sgd_last_error_copy_fn>("sgd_last_error_copy");
+
+        check(engine_open(manifest->c_str(), &engine), "sgd_engine_open");
+    }
+
+    ~gemma_external_draft_backend() {
+        if (session != nullptr && session_close != nullptr) {
+            (void) session_close(session);
+            session = nullptr;
+        }
+        if (engine != nullptr && engine_close != nullptr) {
+            (void) engine_close(engine);
+            engine = nullptr;
+        }
+        if (lib_handle != nullptr) {
+            dlclose(lib_handle);
+            lib_handle = nullptr;
+        }
+    }
+
+    void init(const llama_tokens & prompt) {
+        if (session != nullptr) {
+            check(session_close(session), "sgd_session_close");
+            session = nullptr;
+        }
+        std::vector<uint32_t> prompt_u32(prompt.begin(), prompt.end());
+        check(session_open(engine, prompt_u32.data(), prompt_u32.size(), &session), "sgd_session_open");
+    }
+
+    llama_tokens draft(int max_tokens) {
+        if (session == nullptr) {
+            throw std::runtime_error("draft session is not initialized");
+        }
+        std::vector<uint32_t> tokens((size_t) std::max(0, max_tokens));
+        size_t out_len = 0;
+        sgd_draft_stats stats{};
+        check(session_draft(session, mode, (size_t) std::max(0, max_tokens), tokens.data(), tokens.size(), &out_len, &stats), "sgd_session_draft");
+        tokens.resize(out_len);
+        return llama_tokens(tokens.begin(), tokens.end());
+    }
+
+    void accept(const llama_tokens & accepted_tokens) {
+        if (session == nullptr) {
+            throw std::runtime_error("draft session is not initialized");
+        }
+        std::vector<uint32_t> tokens_u32(accepted_tokens.begin(), accepted_tokens.end());
+        check(session_accept(session, tokens_u32.data(), tokens_u32.size()), "sgd_session_accept");
+    }
+
+    void discard_preview() {
+        if (session == nullptr) {
+            return;
+        }
+        check(session_discard_preview(session), "sgd_session_discard_preview");
+    }
+};
+
 // state of an implementation of speculative decoding
 //
 // each implementation has a unique type and a state that is implementation-specific
@@ -141,7 +308,13 @@ struct common_speculative_state {
             llama_token id_last,
             llama_tokens & result) = 0;
 
+    virtual void accept_tokens(const llama_tokens & accepted_tokens, uint16_t n_accepted) {
+        GGML_UNUSED(accepted_tokens);
+        accept(n_accepted);
+    }
+
     virtual void accept(uint16_t n_accepted) = 0;
+    virtual void discard() {}
 };
 
 struct common_speculative_state_draft : public common_speculative_state {
@@ -155,6 +328,8 @@ struct common_speculative_state_draft : public common_speculative_state {
 
     bool vocab_cmpt = true; // whether retokenization is needed
     std::unordered_map<std::string, std::string> vocab_map;
+    std::unique_ptr<gemma_external_draft_backend> ext_draft;
+    std::optional<llama_token> ext_pending_seed;
 
     common_speculative_state_draft(
             enum common_speculative_type type,
@@ -165,8 +340,21 @@ struct common_speculative_state_draft : public common_speculative_state {
         , ctx_tgt(ctx_tgt)
         , ctx_dft(ctx_dft)
     {
-        batch = llama_batch_init(llama_n_batch(ctx_dft), 0, 1);
         smpl = nullptr;
+
+        if (gemma_external_draft_enabled()) {
+            ext_draft = std::make_unique<gemma_external_draft_backend>();
+            if (this->ctx_dft != nullptr) {
+                llama_free(this->ctx_dft);
+                this->ctx_dft = nullptr;
+            }
+        }
+
+        if (this->ctx_dft != nullptr) {
+            batch = llama_batch_init(llama_n_batch(this->ctx_dft), 0, 1);
+        } else {
+            batch = llama_batch_init(1, 0, 1);
+        }
 
         // TODO: optimize or pass from outside?
         // {
@@ -184,7 +372,7 @@ struct common_speculative_state_draft : public common_speculative_state {
         //
         //     result->smpl = common_sampler_init(llama_get_model(ctx_dft), params);
         // }
-        {
+        if (this->ctx_dft != nullptr) {
             common_params_sampling params;
             params.no_perf = false;
             params.top_k = 10;
@@ -195,29 +383,40 @@ struct common_speculative_state_draft : public common_speculative_state {
             smpl = common_sampler_init(llama_get_model(ctx_dft), params);
         }
 
-        vocab_cmpt = common_speculative_are_compatible(llama_get_model(ctx_tgt), llama_get_model(ctx_dft));
-        LOG_DBG("vocab_cmpt = %d\n", vocab_cmpt);
+        if (this->ctx_dft != nullptr) {
+            vocab_cmpt = common_speculative_are_compatible(llama_get_model(ctx_tgt), llama_get_model(ctx_dft));
+            LOG_DBG("vocab_cmpt = %d\n", vocab_cmpt);
 
-        if (!vocab_cmpt) {
-            LOG_WRN("the target and draft vocabs are not compatible - tokens will be translated between the two\n");
+            if (!vocab_cmpt) {
+                LOG_WRN("the target and draft vocabs are not compatible - tokens will be translated between the two\n");
 
-            for (const auto & pair : replacements) {
-                vocab_map[pair.first] = pair.second;
+                for (const auto & pair : replacements) {
+                    vocab_map[pair.first] = pair.second;
+                }
             }
         }
     }
 
     ~common_speculative_state_draft() override {
-        llama_perf_context_print(ctx_dft);
+        if (ctx_dft != nullptr) {
+            llama_perf_context_print(ctx_dft);
+            llama_free(ctx_dft);
+        }
 
-        llama_free(ctx_dft);
-
-        common_sampler_free(smpl);
+        if (smpl != nullptr) {
+            common_sampler_free(smpl);
+        }
 
         llama_batch_free(batch);
     }
 
     void begin(const llama_tokens & prompt) override {
+        if (ext_draft) {
+            ext_draft->init(prompt);
+            prompt_dft = prompt;
+            ext_pending_seed.reset();
+            return;
+        }
         GGML_UNUSED(prompt);
     }
 
@@ -233,6 +432,19 @@ struct common_speculative_state_draft : public common_speculative_state {
         auto & ctx_dft    = spec->ctx_dft;
         auto & smpl       = spec->smpl;
         auto & prompt_dft = spec->prompt_dft;
+
+        if (spec->ext_draft) {
+            if (prompt_dft != prompt_tgt) {
+                spec->ext_draft->init(prompt_tgt);
+                prompt_dft = prompt_tgt;
+                spec->ext_pending_seed.reset();
+            }
+
+            spec->ext_draft->accept({ id_last });
+            spec->ext_pending_seed = id_last;
+            result = spec->ext_draft->draft(params.n_max);
+            return;
+        }
 
         auto * mem_dft = llama_get_memory(ctx_dft);
 
@@ -406,6 +618,35 @@ struct common_speculative_state_draft : public common_speculative_state {
     void accept(uint16_t n_accepted) override {
         // noop
         GGML_UNUSED(n_accepted);
+    }
+
+    void accept_tokens(const llama_tokens & accepted_tokens, uint16_t n_accepted) override {
+        if (ext_draft) {
+            GGML_UNUSED(n_accepted);
+            if (!accepted_tokens.empty()) {
+                if (ext_pending_seed.has_value() && accepted_tokens.front() == *ext_pending_seed) {
+                    if (accepted_tokens.size() > 1) {
+                        llama_tokens suffix(accepted_tokens.begin() + 1, accepted_tokens.end());
+                        ext_draft->accept(suffix);
+                    }
+                } else {
+                    llama_tokens prompt_reset = prompt_dft;
+                    prompt_reset.insert(prompt_reset.end(), accepted_tokens.begin(), accepted_tokens.end());
+                    ext_draft->init(prompt_reset);
+                }
+                prompt_dft.insert(prompt_dft.end(), accepted_tokens.begin(), accepted_tokens.end());
+            }
+            ext_pending_seed.reset();
+            return;
+        }
+        accept(n_accepted);
+    }
+
+    void discard() override {
+        if (ext_draft) {
+            ext_draft->discard_preview();
+            ext_pending_seed.reset();
+        }
     }
 
     std::string replace_to_dft(const std::string & input) const {
@@ -840,7 +1081,8 @@ common_speculative * common_speculative_init(
         common_params_speculative & params,
         llama_context             * ctx_tgt) {
     llama_context * ctx_dft = nullptr;
-    if (params.model_dft) {
+    const bool use_external_draft = gemma_external_draft_enabled();
+    if (params.model_dft && !use_external_draft) {
         ctx_dft = llama_init_from_model(params.model_dft, params.cparams_dft);
         if (ctx_dft == nullptr) {
             LOG_ERR("%s", "failed to create draft context\n");
@@ -851,7 +1093,7 @@ common_speculative * common_speculative_init(
     // Compute the implementations to use based on the config and their order of preference
     std::vector<common_speculative_config> configs = {}; // list of speculative configs to try
     {
-        bool has_draft = !params.mparams_dft.path.empty();
+        bool has_draft = !params.mparams_dft.path.empty() || use_external_draft;
         bool has_draft_eagle3 = false; // TODO PR-18039: if params.speculative.eagle3
 
         bool has_ngram_cache   = (params.type == COMMON_SPECULATIVE_TYPE_NGRAM_CACHE);
@@ -1025,8 +1267,17 @@ llama_tokens common_speculative_draft(
 }
 
 void common_speculative_accept(common_speculative * spec, uint16_t n_accepted) {
-    if (n_accepted == 0) {
+    common_speculative_accept_tokens(spec, {}, n_accepted);
+}
+
+void common_speculative_accept_tokens(common_speculative * spec, const llama_tokens & accepted_tokens, uint16_t n_accepted) {
+    if (spec == nullptr) {
         return;
+    }
+    if (n_accepted == 0) {
+        if (accepted_tokens.empty()) {
+            return;
+        }
     }
 
     common_speculative_state * impl = spec->curr_impl;
@@ -1040,9 +1291,16 @@ void common_speculative_accept(common_speculative * spec, uint16_t n_accepted) {
             impl->n_acc_tokens += n_accepted;
         }
 
-        impl->accept(n_accepted);
+        impl->accept_tokens(accepted_tokens, n_accepted);
         impl->n_call_accept++;
     }
+}
+
+void common_speculative_discard(common_speculative * spec) {
+    if (spec == nullptr || spec->curr_impl == nullptr) {
+        return;
+    }
+    spec->curr_impl->discard();
 }
 
 void common_speculative_print_stats(const common_speculative * spec) {
