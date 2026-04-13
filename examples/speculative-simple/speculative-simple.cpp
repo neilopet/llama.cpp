@@ -395,6 +395,16 @@ int main(int argc, char ** argv) {
 
         GGML_ASSERT(ids.size() > 0);
 
+        if (params.n_predict >= 0) {
+            const int remaining = params.n_predict - n_predict;
+            if (remaining <= 0) {
+                break;
+            }
+            if ((int) ids.size() > remaining) {
+                ids.resize((size_t) remaining);
+            }
+        }
+
         n_predict += ids.size();
 
         // process the accepted tokens and update contexts
