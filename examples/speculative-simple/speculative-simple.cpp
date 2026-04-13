@@ -347,6 +347,9 @@ int main(int argc, char ** argv) {
                 }
 
                 if (!used_tail) {
+                    if (!stop_tree) {
+                        common_speculative_discard(spec);
+                    }
                     const llama_token next = sample_and_accept_current(smpl, ctx_tgt);
                     ids.push_back(next);
                 }

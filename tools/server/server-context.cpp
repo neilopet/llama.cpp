@@ -308,7 +308,7 @@ struct server_slot {
         generated_token_probs.push_back(token);
     }
 
-    int get_n_draft_max() const {
+    int get_n_draft_max(const common_params & global_params) const {
         GGML_ASSERT(task);
 
         if (!can_speculate()) {
@@ -322,8 +322,17 @@ struct server_slot {
         //       also, need to leave space for 1 extra token to allow context shifts
         n_draft_max = std::min(n_draft_max, n_ctx - prompt.n_tokens() - 2);
 
-        if (n_remaining > 0) {
-            n_draft_max = std::min(n_draft_max, n_remaining - 1);
+        int remaining = -1;
+        if (task->params.n_predict != -1) {
+            remaining = task->params.n_predict - n_decoded;
+        } else if (global_params.n_predict != -1) {
+            remaining = global_params.n_predict - n_decoded;
+        } else if (n_remaining > 0) {
+            remaining = n_remaining;
+        }
+
+        if (remaining > 0) {
+            n_draft_max = std::min(n_draft_max, remaining - 1);
         }
 
         SLT_DBG(*this, "max possible draft: %d\n", n_draft_max);
@@ -2154,7 +2163,7 @@ private:
             // generate draft tokens in speculative decoding mode
             // TODO: rework to have a single draft llama_context shared across all slots [TAG_SERVER_SPEC_REWORK]
             //       perform the speculative drafting for all sequences at the same time in a single batch
-            const int n_draft_max = slot.get_n_draft_max();
+            const int n_draft_max = slot.get_n_draft_max(params_base);
             if (n_draft_max > 0) {
                 if (mctx) {
                     // we should never reach this, as speculative is automatically disabled if mmproj is loaded
@@ -2781,7 +2790,7 @@ private:
                 if (slot.state != SLOT_STATE_GENERATING || !can_use_tree_spec(slot)) {
                     continue;
                 }
-                if (slot.get_n_draft_max() <= 0 || slot.i_batch_dft.size() > 0) {
+                if (slot.get_n_draft_max(params_base) <= 0 || slot.i_batch_dft.size() > 0) {
                     continue;
                 }
 
@@ -2807,7 +2816,7 @@ private:
                     return token;
                 };
 
-                const int n_draft_max = slot.get_n_draft_max();
+                const int n_draft_max = slot.get_n_draft_max(params_base);
                 const llama_token seed_token = slot.sampled;
 
                 llama_tokens ids;
@@ -2924,11 +2933,28 @@ private:
                     }
 
                     if (slot.state == SLOT_STATE_GENERATING && !used_tail) {
+                        if (!stop_tree) {
+                            common_speculative_discard(slot.spec);
+                        }
                         ids.push_back(sample_current());
                     }
                 }
 
                 if (slot.state != SLOT_STATE_GENERATING || ids.empty()) {
+                    continue;
+                }
+
+                if (slot.task->params.n_predict >= 0) {
+                    const int remaining_predict = slot.task->params.n_predict - slot.n_decoded;
+                    if (remaining_predict <= 0) {
+                        continue;
+                    }
+                    if ((int) ids.size() > remaining_predict) {
+                        ids.resize((size_t) remaining_predict);
+                    }
+                }
+
+                if (ids.empty()) {
                     continue;
                 }
 
@@ -2972,7 +2998,7 @@ private:
         const bool has_tree_work = std::any_of(slots.begin(), slots.end(), [&](server_slot & slot) {
             return slot.state == SLOT_STATE_GENERATING &&
                    can_use_tree_spec(slot) &&
-                   slot.get_n_draft_max() > 0 &&
+                   slot.get_n_draft_max(params_base) > 0 &&
                    slot.i_batch_dft.empty();
         });
 
