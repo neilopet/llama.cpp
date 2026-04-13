@@ -22,9 +22,11 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <dlfcn.h>
 #include <filesystem>
 #include <fstream>
 #include <chrono>
+#include <memory>
 #include <optional>
 #include <string>
 #include <vector>
@@ -42,6 +44,7 @@ static constexpr int   MTP_DIM_HID = 256;
 static constexpr int   MTP_DIM_OUT_HIDDEN = 1536;
 static constexpr int   MTP_VOCAB = 262144;
 static constexpr const char * DEFAULT_LITERT_DRAFT_HELPER_BIN = "/home/neilopet/src/github.com/neilopet/strix_infer_spike/target/release/xtask";
+static constexpr const char * DEFAULT_LITERT_DRAFT_FFI_LIB = "/home/neilopet/src/github.com/neilopet/strix_infer_spike/target/release/libstrix_gemma_draft_ffi.so";
 static constexpr const char * DEFAULT_LITERT_DRAFT_MANIFEST = "/home/neilopet/litert_bundles/gemma-4-E2B-it/manifest.json";
 
 struct blob_entry {
@@ -808,11 +811,26 @@ struct proto_metrics {
     int first_token_mismatches = 0;
     int emitted_tokens = 0;
     double draft_build_s = 0.0;
+    double draft_decode_s = 0.0;
+    double draft_mtp_s = 0.0;
+    double draft_self_verify_s = 0.0;
+    double transport_s = 0.0;
     double verify_s = 0.0;
     double draft_sync_s = 0.0;
     double kv_export_s = 0.0;
     double mtp_step_s = 0.0;
     int mtp_steps = 0;
+};
+
+struct external_draft_result {
+    std::vector<llama_token> tokens;
+    double wall_s = 0.0;
+    double draft_decode_s = 0.0;
+    double draft_mtp_s = 0.0;
+    double draft_self_verify_s = 0.0;
+    double transport_s = 0.0;
+    int mtp_extra_attempted = 0;
+    int mtp_extra_accepted = 0;
 };
 
 struct mtp_layer_trace {
@@ -1478,7 +1496,14 @@ static verify_result verify_draft_chunk(
     return result;
 }
 
-struct litert_draft_helper {
+struct external_draft_backend {
+    virtual ~external_draft_backend() = default;
+    virtual void init(const std::vector<llama_token> & prompt) = 0;
+    virtual external_draft_result draft(int max_tokens) = 0;
+    virtual void accept(const std::vector<llama_token> & accepted) = 0;
+};
+
+struct litert_draft_helper final : external_draft_backend {
     pid_t pid = -1;
     FILE * child_in = nullptr;
     FILE * child_out = nullptr;
@@ -1571,7 +1596,7 @@ struct litert_draft_helper {
         return obj;
     }
 
-    void init(const std::vector<llama_token> & prompt) {
+    void init(const std::vector<llama_token> & prompt) override {
         json toks = json::array();
         for (llama_token tok : prompt) {
             toks.push_back((uint32_t) tok);
@@ -1585,19 +1610,31 @@ struct litert_draft_helper {
         }
     }
 
-    std::vector<llama_token> draft(int max_tokens) {
+    external_draft_result draft(int max_tokens) override {
+        const auto t0 = std::chrono::steady_clock::now();
         auto resp = rpc({
             {"cmd", "draft"},
             {"max_tokens", max_tokens},
         });
-        std::vector<llama_token> out;
+        external_draft_result out;
+        out.wall_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
         for (const auto & tok : resp.at("tokens")) {
-            out.push_back((llama_token) tok.get<uint32_t>());
+            out.tokens.push_back((llama_token) tok.get<uint32_t>());
+        }
+        if (resp.contains("stats")) {
+            const auto & stats = resp.at("stats");
+            out.draft_decode_s = stats.value("draft_decode_ns", 0.0) / 1e9;
+            out.draft_mtp_s = stats.value("draft_mtp_ns", 0.0) / 1e9;
+            out.draft_self_verify_s = stats.value("draft_self_verify_ns", 0.0) / 1e9;
+            out.mtp_extra_attempted = stats.value("mtp_extra_attempted", 0);
+            out.mtp_extra_accepted = stats.value("mtp_extra_accepted", 0);
+            const double internal_build_s = stats.value("draft_build_ns", 0.0) / 1e9;
+            out.transport_s = std::max(0.0, out.wall_s - internal_build_s);
         }
         return out;
     }
 
-    void accept(const std::vector<llama_token> & accepted) {
+    void accept(const std::vector<llama_token> & accepted) override {
         json toks = json::array();
         for (llama_token tok : accepted) {
             toks.push_back((uint32_t) tok);
@@ -1609,6 +1646,179 @@ struct litert_draft_helper {
         if (!resp.value("ok", false)) {
             throw std::runtime_error("helper accept failed");
         }
+    }
+};
+
+struct SgdEngine;
+struct SgdSession;
+
+struct sgd_draft_stats {
+    uint64_t returned_tokens = 0;
+    int32_t next_pos = 0;
+    uint64_t draft_build_ns = 0;
+    uint64_t draft_decode_ns = 0;
+    uint64_t draft_mtp_ns = 0;
+    uint64_t draft_self_verify_ns = 0;
+    uint64_t mtp_extra_attempted = 0;
+    uint64_t mtp_extra_accepted = 0;
+};
+
+struct litert_draft_ffi final : external_draft_backend {
+    void * lib_handle = nullptr;
+    SgdEngine * engine = nullptr;
+    SgdSession * session = nullptr;
+    int mode = 0;
+
+    using sgd_engine_open_fn = int (*)(const char *, SgdEngine **);
+    using sgd_engine_close_fn = int (*)(SgdEngine *);
+    using sgd_session_open_fn = int (*)(SgdEngine *, const uint32_t *, size_t, SgdSession **);
+    using sgd_session_close_fn = int (*)(SgdSession *);
+    using sgd_session_draft_fn = int (*)(SgdSession *, int, size_t, uint32_t *, size_t, size_t *, sgd_draft_stats *);
+    using sgd_session_accept_fn = int (*)(SgdSession *, const uint32_t *, size_t);
+    using sgd_last_error_copy_fn = size_t (*)(char *, size_t);
+
+    sgd_engine_open_fn engine_open = nullptr;
+    sgd_engine_close_fn engine_close = nullptr;
+    sgd_session_open_fn session_open = nullptr;
+    sgd_session_close_fn session_close = nullptr;
+    sgd_session_draft_fn session_draft = nullptr;
+    sgd_session_accept_fn session_accept = nullptr;
+    sgd_last_error_copy_fn last_error_copy = nullptr;
+
+    litert_draft_ffi(const std::string & lib_path, const std::string & manifest, const std::string & mode_name) {
+        if (mode_name == "plain") {
+            mode = 0;
+        } else if (mode_name == "mtp") {
+            mode = 1;
+        } else {
+            throw std::runtime_error("ffi draft mode must be plain or mtp");
+        }
+
+        lib_handle = dlopen(lib_path.c_str(), RTLD_NOW | RTLD_LOCAL);
+        if (!lib_handle) {
+            throw std::runtime_error("failed to dlopen draft ffi library: " + lib_path);
+        }
+
+        engine_open = load_symbol<sgd_engine_open_fn>("sgd_engine_open");
+        engine_close = load_symbol<sgd_engine_close_fn>("sgd_engine_close");
+        session_open = load_symbol<sgd_session_open_fn>("sgd_session_open");
+        session_close = load_symbol<sgd_session_close_fn>("sgd_session_close");
+        session_draft = load_symbol<sgd_session_draft_fn>("sgd_session_draft");
+        session_accept = load_symbol<sgd_session_accept_fn>("sgd_session_accept");
+        last_error_copy = load_symbol<sgd_last_error_copy_fn>("sgd_last_error_copy");
+
+        check(engine_open(manifest.c_str(), &engine), "sgd_engine_open");
+    }
+
+    ~litert_draft_ffi() override {
+        if (session && session_close) {
+            (void) session_close(session);
+            session = nullptr;
+        }
+        if (engine && engine_close) {
+            (void) engine_close(engine);
+            engine = nullptr;
+        }
+        if (lib_handle) {
+            dlclose(lib_handle);
+            lib_handle = nullptr;
+        }
+    }
+
+    void init(const std::vector<llama_token> & prompt) override {
+        if (session) {
+            (void) session_close(session);
+            session = nullptr;
+        }
+        std::vector<uint32_t> prompt_u32;
+        prompt_u32.reserve(prompt.size());
+        for (llama_token tok : prompt) {
+            prompt_u32.push_back((uint32_t) tok);
+        }
+        check(session_open(engine, prompt_u32.data(), prompt_u32.size(), &session), "sgd_session_open");
+    }
+
+    external_draft_result draft(int max_tokens) override {
+        if (!session) {
+            throw std::runtime_error("ffi draft requested before init");
+        }
+        external_draft_result out;
+        std::vector<uint32_t> tokens((size_t) std::max(0, max_tokens));
+        size_t out_len = 0;
+        sgd_draft_stats stats{};
+        const auto t0 = std::chrono::steady_clock::now();
+        check(session_draft(
+                session,
+                mode,
+                (size_t) std::max(0, max_tokens),
+                tokens.data(),
+                tokens.size(),
+                &out_len,
+                &stats),
+            "sgd_session_draft");
+        out.wall_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        tokens.resize(out_len);
+        out.tokens.reserve(tokens.size());
+        for (uint32_t tok : tokens) {
+            out.tokens.push_back((llama_token) tok);
+        }
+        const double build_s = (double) stats.draft_build_ns / 1e9;
+        out.transport_s = std::max(0.0, out.wall_s - build_s);
+        out.draft_decode_s = (double) stats.draft_decode_ns / 1e9;
+        out.draft_mtp_s = (double) stats.draft_mtp_ns / 1e9;
+        out.draft_self_verify_s = (double) stats.draft_self_verify_ns / 1e9;
+        out.mtp_extra_attempted = (int) stats.mtp_extra_attempted;
+        out.mtp_extra_accepted = (int) stats.mtp_extra_accepted;
+        return out;
+    }
+
+    void accept(const std::vector<llama_token> & accepted) override {
+        if (!session) {
+            throw std::runtime_error("ffi accept requested before init");
+        }
+        std::vector<uint32_t> accepted_u32;
+        accepted_u32.reserve(accepted.size());
+        for (llama_token tok : accepted) {
+            accepted_u32.push_back((uint32_t) tok);
+        }
+        check(session_accept(session, accepted_u32.data(), accepted_u32.size()), "sgd_session_accept");
+    }
+
+private:
+    template <typename Fn>
+    Fn load_symbol(const char * name) {
+        dlerror();
+        void * sym = dlsym(lib_handle, name);
+        if (!sym) {
+            throw std::runtime_error(std::string("failed to resolve symbol ") + name);
+        }
+        return reinterpret_cast<Fn>(sym);
+    }
+
+    std::string last_error() const {
+        if (!last_error_copy) {
+            return {};
+        }
+        const size_t needed = last_error_copy(nullptr, 0);
+        std::string msg(needed + 1, '\0');
+        if (needed > 0) {
+            last_error_copy(msg.data(), msg.size());
+            msg.resize(std::strlen(msg.c_str()));
+        } else {
+            msg.clear();
+        }
+        return msg;
+    }
+
+    void check(int rc, const char * op) const {
+        if (rc == 0) {
+            return;
+        }
+        std::string msg = last_error();
+        if (msg.empty()) {
+            msg = "unknown ffi error";
+        }
+        throw std::runtime_error(std::string(op) + " failed: " + msg);
     }
 };
 
@@ -1830,7 +2040,9 @@ static std::vector<std::string> strip_custom_args(
         bool & base_compare,
         std::optional<std::string> & report_path,
         bool & draft_only,
+        std::string & draft_backend,
         std::optional<std::string> & litert_draft_helper_bin,
+        std::optional<std::string> & litert_draft_lib,
         std::optional<std::string> & litert_draft_manifest,
         std::string & litert_draft_mode) {
     std::vector<std::string> out;
@@ -1874,11 +2086,25 @@ static std::vector<std::string> strip_custom_args(
             report_path = argv[++i];
             continue;
         }
+        if (arg == "--gemma4-draft-backend") {
+            if (i + 1 >= argc) {
+                throw std::runtime_error("--gemma4-draft-backend requires gguf, helper, or ffi");
+            }
+            draft_backend = argv[++i];
+            continue;
+        }
         if (arg == "--gemma4-litert-draft-helper-bin") {
             if (i + 1 >= argc) {
                 throw std::runtime_error("--gemma4-litert-draft-helper-bin requires a path");
             }
             litert_draft_helper_bin = argv[++i];
+            continue;
+        }
+        if (arg == "--gemma4-litert-draft-lib") {
+            if (i + 1 >= argc) {
+                throw std::runtime_error("--gemma4-litert-draft-lib requires a path");
+            }
+            litert_draft_lib = argv[++i];
             continue;
         }
         if (arg == "--gemma4-litert-draft-manifest") {
@@ -1910,7 +2136,9 @@ int main(int argc, char ** argv) {
         bool base_compare = false;
         std::optional<std::string> report_path;
         bool draft_only = false;
+        std::string draft_backend = "gguf";
         std::optional<std::string> litert_draft_helper_bin;
+        std::optional<std::string> litert_draft_lib;
         std::optional<std::string> litert_draft_manifest;
         std::string litert_draft_mode = "mtp";
         std::vector<std::string> stripped = strip_custom_args(
@@ -1922,7 +2150,9 @@ int main(int argc, char ** argv) {
                 base_compare,
                 report_path,
                 draft_only,
+                draft_backend,
                 litert_draft_helper_bin,
+                litert_draft_lib,
                 litert_draft_manifest,
                 litert_draft_mode);
         std::vector<char *> argv2;
@@ -1933,18 +2163,38 @@ int main(int argc, char ** argv) {
         argc = (int) argv2.size();
         argv = argv2.data();
 
-        const bool use_litert_draft_helper = litert_draft_helper_bin.has_value();
+        if (draft_backend != "gguf" && draft_backend != "helper" && draft_backend != "ffi") {
+            throw std::runtime_error("--gemma4-draft-backend must be gguf, helper, or ffi");
+        }
+        if (draft_backend == "gguf" && litert_draft_helper_bin.has_value()) {
+            draft_backend = "helper";
+        }
+        if (draft_backend == "gguf" && litert_draft_lib.has_value()) {
+            draft_backend = "ffi";
+        }
+        const bool use_litert_draft_helper = draft_backend == "helper";
+        const bool use_litert_draft_ffi = draft_backend == "ffi";
+        const bool use_external_draft = use_litert_draft_helper || use_litert_draft_ffi;
         const bool use_mtp = sidecar_dir.has_value();
-        if (use_litert_draft_helper && use_mtp) {
-            throw std::runtime_error("cannot combine --gemma4-mtp-sidecar with --gemma4-litert-draft-helper-bin");
+        if (use_litert_draft_helper && litert_draft_lib.has_value()) {
+            throw std::runtime_error("--gemma4-litert-draft-lib cannot be combined with --gemma4-draft-backend helper");
+        }
+        if (use_litert_draft_ffi && litert_draft_helper_bin.has_value()) {
+            throw std::runtime_error("--gemma4-litert-draft-helper-bin cannot be combined with --gemma4-draft-backend ffi");
+        }
+        if (use_external_draft && use_mtp) {
+            throw std::runtime_error("cannot combine --gemma4-mtp-sidecar with external draft backends");
         }
         if (litert_draft_mode != "plain" && litert_draft_mode != "mtp") {
             throw std::runtime_error("--gemma4-litert-draft-mode must be plain or mtp");
         }
+        if (!use_external_draft && litert_draft_mode != "mtp") {
+            throw std::runtime_error("--gemma4-litert-draft-mode requires --gemma4-draft-backend helper|ffi");
+        }
         const bool offline_fixture = fixture_dir.has_value() && !base_compare;
         proto_metrics metrics;
         metrics.draft_only = draft_only;
-        metrics.use_mtp = use_mtp || (use_litert_draft_helper && litert_draft_mode == "mtp");
+        metrics.use_mtp = use_mtp || (use_external_draft && litert_draft_mode == "mtp");
         std::optional<mtp_sidecar> mtp;
         if (use_mtp) {
             mtp.emplace(load_mtp_sidecar(*sidecar_dir));
@@ -2088,7 +2338,7 @@ int main(int argc, char ** argv) {
             LOG_ERR("%s: prototype requires --parallel 1\n", __func__);
             return 1;
         }
-        if (!draft_only && params.speculative.mparams_dft.path.empty() && !use_litert_draft_helper) {
+        if (!draft_only && params.speculative.mparams_dft.path.empty() && !use_external_draft) {
             LOG_ERR("%s: --model-draft is required unless --gemma4-mtp-draft-only is set\n", __func__);
             return 1;
         }
@@ -2101,7 +2351,7 @@ int main(int argc, char ** argv) {
         params_dft.n_ctx = draft_only ? params.n_ctx : params.speculative.n_ctx;
         params_dft.n_batch = std::max(params_dft.n_batch, params_dft.n_ctx);
         params_dft.devices.clear();
-        if (!draft_only && !use_litert_draft_helper) {
+        if (!draft_only && !use_external_draft) {
             params_dft.model = params.speculative.mparams_dft;
         }
         params_dft.n_gpu_layers = 0;
@@ -2112,7 +2362,7 @@ int main(int argc, char ** argv) {
         std::unique_ptr<common_init_result> llama_init_tgt;
         llama_model * model_tgt = nullptr;
         llama_context * ctx_tgt = nullptr;
-        if (!draft_only || use_litert_draft_helper) {
+        if (!draft_only || use_external_draft) {
             llama_init_tgt = common_init_from_params(params);
             model_tgt = llama_init_tgt->model();
             ctx_tgt = llama_init_tgt->context();
@@ -2121,16 +2371,16 @@ int main(int argc, char ** argv) {
         std::unique_ptr<common_init_result> llama_init_dft;
         llama_model * model_dft = nullptr;
         llama_context * ctx_dft = nullptr;
-        if (!use_litert_draft_helper) {
+        if (!use_external_draft) {
             llama_init_dft = common_init_from_params(params_dft);
             model_dft = llama_init_dft->model();
             ctx_dft = llama_init_dft->context();
             llama_set_embeddings(ctx_dft, true);
         }
 
-        const llama_vocab * vocab_dft = use_litert_draft_helper ? llama_model_get_vocab(model_tgt) : llama_model_get_vocab(model_dft);
+        const llama_vocab * vocab_dft = use_external_draft ? llama_model_get_vocab(model_tgt) : llama_model_get_vocab(model_dft);
         const llama_vocab * vocab_tgt = draft_only ? vocab_dft : llama_model_get_vocab(model_tgt);
-        if (!draft_only && !use_litert_draft_helper && llama_vocab_n_tokens(vocab_tgt) != llama_vocab_n_tokens(vocab_dft)) {
+        if (!draft_only && !use_external_draft && llama_vocab_n_tokens(vocab_tgt) != llama_vocab_n_tokens(vocab_dft)) {
             LOG_ERR("%s: target and draft vocab sizes differ\n", __func__);
             return 1;
         }
@@ -2147,14 +2397,14 @@ int main(int argc, char ** argv) {
                 prompt.push_back((llama_token) tok);
             }
         } else {
-            prompt = common_tokenize(use_litert_draft_helper ? ctx_tgt : ctx_dft, params.prompt, true, true);
+            prompt = common_tokenize(use_external_draft ? ctx_tgt : ctx_dft, params.prompt, true, true);
         }
-        if ((draft_only ? 0 : ((int) prompt.size() > (int) llama_n_ctx(ctx_tgt))) || (!use_litert_draft_helper && (int) prompt.size() > (int) llama_n_ctx(ctx_dft))) {
+        if ((draft_only ? 0 : ((int) prompt.size() > (int) llama_n_ctx(ctx_tgt))) || (!use_external_draft && (int) prompt.size() > (int) llama_n_ctx(ctx_dft))) {
             LOG_ERR("%s: prompt too long\n", __func__);
             return 1;
         }
 
-        llama_context * ctx_out = draft_only ? (use_litert_draft_helper ? ctx_tgt : ctx_dft) : ctx_tgt;
+        llama_context * ctx_out = draft_only ? (use_external_draft ? ctx_tgt : ctx_dft) : ctx_tgt;
 
         LOG("\n\n");
         for (auto tok : prompt) {
@@ -2166,21 +2416,28 @@ int main(int argc, char ** argv) {
         if (!draft_only) {
             decode_tokens(ctx_tgt, prompt, n_past_tgt, false);
         }
-        std::optional<litert_draft_helper> litert_helper;
+        std::unique_ptr<external_draft_backend> external_draft;
         if (use_litert_draft_helper) {
-            litert_helper.emplace(
+            external_draft = std::make_unique<litert_draft_helper>(
                     litert_draft_helper_bin.value_or(DEFAULT_LITERT_DRAFT_HELPER_BIN),
                     litert_draft_manifest.value_or(DEFAULT_LITERT_DRAFT_MANIFEST),
                     litert_draft_mode);
-            litert_helper->init(prompt);
+            external_draft->init(prompt);
+            n_past_dft = (int) prompt.size();
+        } else if (use_litert_draft_ffi) {
+            external_draft = std::make_unique<litert_draft_ffi>(
+                    litert_draft_lib.value_or(DEFAULT_LITERT_DRAFT_FFI_LIB),
+                    litert_draft_manifest.value_or(DEFAULT_LITERT_DRAFT_MANIFEST),
+                    litert_draft_mode);
+            external_draft->init(prompt);
             n_past_dft = (int) prompt.size();
         } else {
             decode_tokens(ctx_dft, prompt, n_past_dft, true);
         }
 
         if (step_compare.has_value()) {
-            if (use_litert_draft_helper) {
-                throw std::runtime_error("--gemma4-mtp-step-compare is incompatible with --gemma4-litert-draft-helper-bin");
+            if (use_external_draft) {
+                throw std::runtime_error("--gemma4-mtp-step-compare is incompatible with external draft backends");
             }
             if (!mtp) {
                 throw std::runtime_error("--gemma4-mtp-step-compare requires --gemma4-mtp-sidecar");
@@ -2198,8 +2455,8 @@ int main(int argc, char ** argv) {
             return 0;
         }
         if (base_compare) {
-            if (use_litert_draft_helper) {
-                throw std::runtime_error("--gemma4-mtp-base-compare is incompatible with --gemma4-litert-draft-helper-bin");
+            if (use_external_draft) {
+                throw std::runtime_error("--gemma4-mtp-base-compare is incompatible with external draft backends");
             }
             json report = run_live_base_compare(ctx_dft, *live_fixture, vocab_dft);
             if (report_path) {
@@ -2224,8 +2481,13 @@ int main(int argc, char ** argv) {
             std::vector<llama_token> draft;
             mtp_timing mtp_t{};
             const auto t_draft0 = std::chrono::steady_clock::now();
-            if (use_litert_draft_helper) {
-                draft = litert_helper->draft(draft_max);
+            if (use_external_draft) {
+                external_draft_result ext = external_draft->draft(draft_max);
+                draft = std::move(ext.tokens);
+                metrics.draft_decode_s += ext.draft_decode_s;
+                metrics.draft_mtp_s += ext.draft_mtp_s;
+                metrics.draft_self_verify_s += ext.draft_self_verify_s;
+                metrics.transport_s += ext.transport_s;
             } else {
                 const float * dft_logits = llama_get_logits_ith(ctx_dft, -1);
                 const float * dft_hidden = llama_get_embeddings_ith(ctx_dft, -1);
@@ -2265,8 +2527,8 @@ int main(int argc, char ** argv) {
                 metrics.full_match_chunks += vr.full_match ? 1 : 0;
             }
             const auto t_sync0 = std::chrono::steady_clock::now();
-            if (use_litert_draft_helper) {
-                litert_helper->accept(accepted);
+            if (use_external_draft) {
+                external_draft->accept(accepted);
                 n_past_dft += (int) accepted.size();
             } else {
                 decode_tokens(ctx_dft, accepted, n_past_dft, true);
@@ -2293,9 +2555,11 @@ int main(int argc, char ** argv) {
         if (report_path) {
             json report = {
                 {"draft_only", metrics.draft_only},
+                {"draft_backend", draft_backend},
                 {"use_mtp", metrics.use_mtp},
                 {"use_litert_draft_helper", use_litert_draft_helper},
-                {"litert_draft_mode", use_litert_draft_helper ? litert_draft_mode : ""},
+                {"use_litert_draft_ffi", use_litert_draft_ffi},
+                {"litert_draft_mode", use_external_draft ? litert_draft_mode : ""},
                 {"chunks", metrics.chunks},
                 {"proposed_tokens", metrics.proposed_tokens},
                 {"accepted_tokens", metrics.accepted_tokens},
@@ -2305,12 +2569,18 @@ int main(int argc, char ** argv) {
                 {"first_token_mismatches", metrics.first_token_mismatches},
                 {"emitted_tokens", metrics.emitted_tokens},
                 {"draft_build_s", metrics.draft_build_s},
+                {"draft_decode_s", metrics.draft_decode_s},
+                {"draft_mtp_s", metrics.draft_mtp_s},
+                {"draft_self_verify_s", metrics.draft_self_verify_s},
+                {"transport_s", metrics.transport_s},
                 {"verify_s", metrics.verify_s},
                 {"draft_sync_s", metrics.draft_sync_s},
                 {"kv_export_s", metrics.kv_export_s},
                 {"mtp_step_s", metrics.mtp_step_s},
                 {"mtp_steps", metrics.mtp_steps},
                 {"acceptance_rate", metrics.proposed_tokens > 0 ? (double) metrics.accepted_from_draft / (double) metrics.proposed_tokens : 0.0},
+                {"avg_proposed_per_chunk", metrics.chunks > 0 ? (double) metrics.proposed_tokens / (double) metrics.chunks : 0.0},
+                {"avg_accepted_per_chunk", metrics.chunks > 0 ? (double) metrics.accepted_from_draft / (double) metrics.chunks : 0.0},
                 {"emitted_per_chunk", metrics.chunks > 0 ? (double) metrics.emitted_tokens / (double) metrics.chunks : 0.0},
                 {"generated_text", generated_text},
             };
