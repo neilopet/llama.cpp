@@ -28,6 +28,8 @@ def build_mode_args(mode: str, args) -> list[str]:
         "--top-k", "1",
         "--top-p", "1",
     ]
+    if mode == "no_draft":
+        return common + ["--gemma4-draft-backend", "none"]
     if mode == "gguf_plain":
         return common + ["-md", str(args.draft_model)]
     if mode == "hybrid_mtp":
@@ -65,6 +67,16 @@ def build_mode_args(mode: str, args) -> list[str]:
             "--gemma4-litert-draft-manifest", str(args.manifest),
             "--gemma4-litert-draft-mode", "mtp",
         ]
+    if mode == "ffi_tree_mtp":
+        return common + [
+            "--gemma4-draft-backend", "ffi",
+            "--gemma4-litert-draft-lib", str(args.ffi_lib),
+            "--gemma4-litert-draft-manifest", str(args.manifest),
+            "--gemma4-litert-draft-mode", "tree_mtp",
+            "--gemma4-tree-width", str(args.tree_width),
+            "--gemma4-tree-depth", str(args.tree_depth),
+            "--gemma4-tree-plain-tail", str(args.tree_plain_tail),
+        ]
     raise SystemExit(f"unknown mode: {mode}")
 
 
@@ -85,6 +97,9 @@ def summarize_runs(runs):
         "transport_s",
         "verify_s",
         "draft_sync_s",
+        "tree_nodes",
+        "tree_prefix_tokens",
+        "tail_tokens",
         "avg_proposed_per_chunk",
         "avg_accepted_per_chunk",
         "emitted_per_chunk",
@@ -112,7 +127,10 @@ def main():
     p.add_argument("--output", type=Path, required=True)
     p.add_argument("--reps", type=int, default=3)
     p.add_argument("--n-predict", type=int, default=32)
-    p.add_argument("--modes", default="gguf_plain,hybrid_mtp,helper_plain,helper_mtp,ffi_plain,ffi_mtp")
+    p.add_argument("--tree-width", type=int, default=4)
+    p.add_argument("--tree-depth", type=int, default=2)
+    p.add_argument("--tree-plain-tail", type=int, default=8)
+    p.add_argument("--modes", default="no_draft,gguf_plain,hybrid_mtp,helper_plain,helper_mtp,ffi_plain,ffi_mtp,ffi_tree_mtp")
     args = p.parse_args()
 
     modes = [m.strip() for m in args.modes.split(",") if m.strip()]
