@@ -71,6 +71,12 @@
 #define N_R0_IQ4_XS 2
 #define N_SG_IQ4_XS 2
 
+#define N_R0_TQ3_1S 8
+#define N_SG_TQ3_1S 2
+
+#define N_R0_TQ4_1S 8
+#define N_SG_TQ4_1S 2
+
 // function constants offsets
 #define FC_FLASH_ATTN_EXT_PAD          100
 #define FC_FLASH_ATTN_EXT_BLK          200
@@ -88,6 +94,7 @@
 #define FC_SUM_ROWS                    1400
 #define FC_UPSCALE                     1500
 #define FC_GATED_DELTA_NET             1600
+#define FC_TURBO_WHT                   1700
 
 // op-specific constants
 #define OP_FLASH_ATTN_EXT_NQPSG 8
@@ -875,6 +882,11 @@ typedef struct {
     uint64_t nb2;
     uint64_t nb3;
 } ggml_metal_kargs_gated_delta_net;
+
+typedef struct {
+    int64_t  n_elements;  // total elements in tensor
+    int32_t  direction;   // 0 = forward, 1 = inverse
+} ggml_metal_kargs_turbo_wht;
 
 typedef struct {
     int32_t  ne00;
