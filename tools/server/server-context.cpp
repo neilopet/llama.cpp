@@ -3145,7 +3145,7 @@ private:
                     // prompt evaluated for next-token prediction
                     slot.state = SLOT_STATE_GENERATING;
 
-                    if (slot.can_speculate()) {
+                    if (slot.can_speculate() && slot.get_n_draft_max(params_base) > 0) {
                         common_speculative_begin(slot.spec, slot.prompt.tokens.get_text_tokens());
                     }
                 } else if (slot.state != SLOT_STATE_GENERATING) {
