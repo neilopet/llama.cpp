@@ -177,6 +177,7 @@ struct gemma_external_draft_backend {
     using sgd_session_close_fn = int (*)(SgdSession *);
     using sgd_session_draft_fn = int (*)(SgdSession *, int, size_t, uint32_t *, size_t, size_t *, sgd_draft_stats *);
     using sgd_session_accept_fn = int (*)(SgdSession *, const uint32_t *, size_t);
+    using sgd_session_append_prompt_fn = int (*)(SgdSession *, const uint32_t *, size_t);
     using sgd_session_preview_tree_level_fn = int (*)(SgdSession *, size_t, sgd_tree_level_candidate *, size_t, size_t *, sgd_tree_level_stats *);
     using sgd_session_commit_tree_token_fn = int (*)(SgdSession *, uint32_t);
     using sgd_session_discard_preview_fn = int (*)(SgdSession *);
@@ -186,6 +187,7 @@ struct gemma_external_draft_backend {
     SgdEngine * engine = nullptr;
     SgdSession * session = nullptr;
     int mode = 0;
+    llama_tokens prompt_session;
 
     sgd_engine_open_fn engine_open = nullptr;
     sgd_engine_close_fn engine_close = nullptr;
@@ -193,6 +195,7 @@ struct gemma_external_draft_backend {
     sgd_session_close_fn session_close = nullptr;
     sgd_session_draft_fn session_draft = nullptr;
     sgd_session_accept_fn session_accept = nullptr;
+    sgd_session_append_prompt_fn session_append_prompt = nullptr;
     sgd_session_preview_tree_level_fn session_preview_tree_level = nullptr;
     sgd_session_commit_tree_token_fn session_commit_tree_token = nullptr;
     sgd_session_discard_preview_fn session_discard_preview = nullptr;
@@ -252,6 +255,7 @@ struct gemma_external_draft_backend {
         session_close = load_symbol<sgd_session_close_fn>("sgd_session_close");
         session_draft = load_symbol<sgd_session_draft_fn>("sgd_session_draft");
         session_accept = load_symbol<sgd_session_accept_fn>("sgd_session_accept");
+        session_append_prompt = load_symbol<sgd_session_append_prompt_fn>("sgd_session_append_prompt");
         session_preview_tree_level = load_symbol<sgd_session_preview_tree_level_fn>("sgd_session_preview_tree_level");
         session_commit_tree_token = load_symbol<sgd_session_commit_tree_token_fn>("sgd_session_commit_tree_token");
         session_discard_preview = load_symbol<sgd_session_discard_preview_fn>("sgd_session_discard_preview");
@@ -265,6 +269,7 @@ struct gemma_external_draft_backend {
             (void) session_close(session);
             session = nullptr;
         }
+        prompt_session.clear();
         if (engine != nullptr && engine_close != nullptr) {
             (void) engine_close(engine);
             engine = nullptr;
@@ -275,13 +280,43 @@ struct gemma_external_draft_backend {
         }
     }
 
+    void ensure_session() {
+        if (session != nullptr) {
+            return;
+        }
+        check(session_open(engine, nullptr, 0, &session), "sgd_session_open");
+        prompt_session.clear();
+    }
+
+    void append_prompt(const llama_tokens & prompt_tokens) {
+        if (prompt_tokens.empty()) {
+            return;
+        }
+        ensure_session();
+        std::vector<uint32_t> prompt_u32(prompt_tokens.begin(), prompt_tokens.end());
+        check(session_append_prompt(session, prompt_u32.data(), prompt_u32.size()), "sgd_session_append_prompt");
+        prompt_session.insert(prompt_session.end(), prompt_tokens.begin(), prompt_tokens.end());
+    }
+
     void init(const llama_tokens & prompt) {
+        if (session == nullptr) {
+            ensure_session();
+        }
+        if (prompt == prompt_session) {
+            return;
+        }
+        if (prompt.size() >= prompt_session.size() &&
+                std::equal(prompt_session.begin(), prompt_session.end(), prompt.begin())) {
+            append_prompt(llama_tokens(prompt.begin() + prompt_session.size(), prompt.end()));
+            return;
+        }
         if (session != nullptr) {
             check(session_close(session), "sgd_session_close");
             session = nullptr;
         }
-        std::vector<uint32_t> prompt_u32(prompt.begin(), prompt.end());
-        check(session_open(engine, prompt_u32.data(), prompt_u32.size(), &session), "sgd_session_open");
+        prompt_session.clear();
+        ensure_session();
+        append_prompt(prompt);
     }
 
     llama_tokens draft(int max_tokens) {
@@ -302,6 +337,7 @@ struct gemma_external_draft_backend {
         }
         std::vector<uint32_t> tokens_u32(accepted_tokens.begin(), accepted_tokens.end());
         check(session_accept(session, tokens_u32.data(), tokens_u32.size()), "sgd_session_accept");
+        prompt_session.insert(prompt_session.end(), accepted_tokens.begin(), accepted_tokens.end());
     }
 
     void discard_preview() {
@@ -345,6 +381,7 @@ struct gemma_external_draft_backend {
             throw std::runtime_error("draft session is not initialized");
         }
         check(session_commit_tree_token(session, (uint32_t) token), "sgd_session_commit_tree_token");
+        prompt_session.push_back(token);
     }
 
     llama_tokens draft_plain(int max_tokens) {
@@ -388,6 +425,9 @@ struct common_speculative_state {
     virtual ~common_speculative_state() = default;
 
     virtual void begin(const llama_tokens & prompt) = 0;
+    virtual void append_prompt(const llama_tokens & prompt_tokens) {
+        GGML_UNUSED(prompt_tokens);
+    }
 
     virtual void draft(
             const common_params_speculative & params,
@@ -522,6 +562,15 @@ struct common_speculative_state_draft : public common_speculative_state {
             return;
         }
         GGML_UNUSED(prompt);
+    }
+
+    void append_prompt(const llama_tokens & prompt_tokens) override {
+        if (!ext_draft || prompt_tokens.empty()) {
+            return;
+        }
+        ext_draft->append_prompt(prompt_tokens);
+        prompt_dft.insert(prompt_dft.end(), prompt_tokens.begin(), prompt_tokens.end());
+        ext_pending_seed.reset();
     }
 
     void draft(
@@ -1377,6 +1426,16 @@ void common_speculative_begin(common_speculative * spec, const llama_tokens & pr
         common_time_meas tm(impl->t_begin_us, !impl->gen_perf);
         impl->begin(prompt);
         impl->n_call_begin++;
+    }
+}
+
+void common_speculative_append_prompt(common_speculative * spec, const llama_tokens & prompt_tokens) {
+    if (spec == nullptr || prompt_tokens.empty()) {
+        return;
+    }
+
+    for (auto & impl : spec->impls) {
+        impl->append_prompt(prompt_tokens);
     }
 }
 

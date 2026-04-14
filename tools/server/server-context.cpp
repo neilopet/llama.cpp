@@ -3089,6 +3089,33 @@ private:
             // on successful decode, restore the original batch size
             n_batch = llama_n_batch(ctx);
 
+            for (auto & slot : slots) {
+                if ((slot.state != SLOT_STATE_PROCESSING_PROMPT && slot.state != SLOT_STATE_DONE_PROMPT) ||
+                    !slot.can_speculate() ||
+                    slot.get_n_draft_max(params_base) <= 0) {
+                    continue;
+                }
+
+                llama_tokens prompt_chunk;
+                prompt_chunk.reserve(n_tokens);
+                for (int32_t j = 0; j < n_tokens; ++j) {
+                    if (batch_view.token[j] == LLAMA_TOKEN_NULL) {
+                        continue;
+                    }
+                    const int32_t n_seq = batch_view.n_seq_id[j];
+                    for (int32_t k = 0; k < n_seq; ++k) {
+                        if (batch_view.seq_id[j][k] == slot.id) {
+                            prompt_chunk.push_back(batch_view.token[j]);
+                            break;
+                        }
+                    }
+                }
+
+                if (!prompt_chunk.empty()) {
+                    common_speculative_append_prompt(slot.spec, prompt_chunk);
+                }
+            }
+
             // handle `n_cmpl > 1` tasks - when the main prompt is processed, activate all child tasks too
             for (auto & slot : slots) {
                 if (slot.state == SLOT_STATE_DONE_PROMPT && slot.task->is_parent()) {
