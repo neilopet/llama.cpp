@@ -8,11 +8,14 @@
 #include <algorithm>
 #include <cctype>
 #include <clocale>
+#include <cmath>
 #include <cstdlib>
 #include <cstdio>
 #include <cstring>
+#include <functional>
 #include <optional>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 static std::optional<std::string> env_str_nonempty(const char * name) {
@@ -56,6 +59,198 @@ static llama_token sample_and_accept_current(struct common_sampler * smpl, struc
     return token;
 }
 
+static llama_token greedy_from_logits(const llama_vocab * vocab, const float * logits) {
+    const int n_vocab = llama_vocab_n_tokens(vocab);
+    llama_token best = 0;
+    float best_logit = -INFINITY;
+    for (int i = 0; i < n_vocab; ++i) {
+        if (llama_vocab_is_eog(vocab, i)) {
+            continue;
+        }
+        if (logits[i] > best_logit) {
+            best_logit = logits[i];
+            best = i;
+        }
+    }
+    return best;
+}
+
+struct tree_leaf_path {
+    int seq_id = 0;
+    uint32_t leaf_node_id = 0;
+    std::vector<const common_speculative_tree_node *> nodes;
+};
+
+static std::vector<tree_leaf_path> build_tree_leaf_paths(const common_speculative_tree & tree) {
+    std::unordered_map<uint32_t, std::vector<const common_speculative_tree_node *>> children;
+    children.reserve(tree.nodes.size());
+    for (const auto & node : tree.nodes) {
+        children[node.parent_id].push_back(&node);
+    }
+
+    std::vector<tree_leaf_path> result;
+    std::vector<const common_speculative_tree_node *> stack;
+
+    std::function<void(uint32_t)> dfs = [&](uint32_t parent_id) {
+        auto it = children.find(parent_id);
+        if (it == children.end() || it->second.empty()) {
+            if (stack.empty()) {
+                result.push_back(tree_leaf_path{});
+            } else {
+                tree_leaf_path path;
+                path.leaf_node_id = stack.back()->node_id;
+                path.nodes = stack;
+                result.push_back(std::move(path));
+            }
+            return;
+        }
+
+        for (const auto * child : it->second) {
+            stack.push_back(child);
+            dfs(child->node_id);
+            stack.pop_back();
+        }
+    };
+
+    dfs(0);
+
+    for (size_t i = 0; i < result.size(); ++i) {
+        result[i].seq_id = (int) i;
+    }
+
+    return result;
+}
+
+struct tree_verify_result {
+    llama_tokens ids;
+    int proposed = 0;
+    int accepted_from_draft = 0;
+    uint32_t committed_node_id = 0;
+    int committed_seq_id = 0;
+    llama_token next_token = 0;
+};
+
+static tree_verify_result verify_tree_batched(
+        llama_context * ctx_tgt,
+        llama_batch & batch_tgt,
+        llama_memory_t mem_tgt,
+        common_sampler * smpl,
+        const llama_vocab * vocab,
+        int & n_past,
+        const common_speculative_tree & tree) {
+    tree_verify_result result;
+    result.proposed = 1 + (int) tree.nodes.size();
+
+    const auto leaf_paths = build_tree_leaf_paths(tree);
+    const int n_leaf = std::max<int>(1, leaf_paths.size());
+    const int n_past_base = n_past;
+
+    for (int seq = 1; seq < n_leaf; ++seq) {
+        llama_memory_seq_rm(mem_tgt, seq, -1, -1);
+        llama_memory_seq_cp(mem_tgt, 0, seq, -1, -1);
+    }
+
+    common_batch_clear(batch_tgt);
+
+    int idx_after_seed = -1;
+    std::unordered_map<uint32_t, int> node_batch_idx;
+    std::unordered_map<uint32_t, int> node_seq;
+    node_batch_idx.reserve(tree.nodes.size());
+    node_seq.reserve(tree.nodes.size());
+
+    for (const auto & path : leaf_paths) {
+        common_batch_add(batch_tgt, tree.seed_token, n_past_base, { path.seq_id }, true);
+        if (idx_after_seed < 0) {
+            idx_after_seed = batch_tgt.n_tokens - 1;
+        }
+    }
+
+    size_t max_nodes = 0;
+    for (const auto & path : leaf_paths) {
+        max_nodes = std::max(max_nodes, path.nodes.size());
+    }
+
+    for (size_t depth = 0; depth < max_nodes; ++depth) {
+        for (const auto & path : leaf_paths) {
+            if (depth >= path.nodes.size()) {
+                continue;
+            }
+            const auto * node = path.nodes[depth];
+            common_batch_add(batch_tgt, node->token, n_past_base + 1 + (int) depth, { path.seq_id }, true);
+            node_batch_idx.emplace(node->node_id, batch_tgt.n_tokens - 1);
+            node_seq.emplace(node->node_id, path.seq_id);
+        }
+    }
+
+    if (llama_decode(ctx_tgt, batch_tgt) != 0) {
+        throw std::runtime_error("llama_decode failed in batched tree verification");
+    }
+
+    uint32_t parent_id = 0;
+    int committed_seq = 0;
+    result.ids.push_back(tree.seed_token);
+    result.accepted_from_draft = 1;
+    int repr_idx = idx_after_seed;
+    int committed_tokens = 1;
+    common_sampler_accept(smpl, tree.seed_token, true);
+    llama_token predicted = common_sampler_sample(smpl, ctx_tgt, repr_idx);
+    result.next_token = predicted;
+
+    while (true) {
+        const common_speculative_tree_node * matched = nullptr;
+        for (const auto & node : tree.nodes) {
+            if (node.parent_id == parent_id && node.token == predicted) {
+                matched = &node;
+                break;
+            }
+        }
+
+        if (matched == nullptr) {
+            break;
+        }
+
+        parent_id = matched->node_id;
+        result.committed_node_id = matched->node_id;
+        committed_seq = node_seq.at(matched->node_id);
+        repr_idx = node_batch_idx.at(matched->node_id);
+        result.ids.push_back(predicted);
+        result.accepted_from_draft += 1;
+        committed_tokens += 1;
+        common_sampler_accept(smpl, predicted, true);
+
+        predicted = common_sampler_sample(smpl, ctx_tgt, repr_idx);
+        result.next_token = predicted;
+
+        bool has_children = false;
+        for (const auto & node : tree.nodes) {
+            if (node.parent_id == parent_id) {
+                has_children = true;
+                break;
+            }
+        }
+        if (!has_children) {
+            break;
+        }
+    }
+
+    result.ids.push_back(result.next_token);
+    result.committed_seq_id = committed_seq;
+
+    if (result.accepted_from_draft > 0) {
+        const int n_keep = n_past_base + committed_tokens;
+        const int keep_seq = result.committed_node_id == 0 ? 0 : committed_seq;
+        llama_memory_seq_rm(mem_tgt, keep_seq, n_keep, -1);
+        llama_memory_seq_keep(mem_tgt, keep_seq);
+        if (keep_seq != 0) {
+            llama_memory_seq_cp(mem_tgt, keep_seq, 0, -1, -1);
+        }
+        llama_memory_seq_keep(mem_tgt, 0);
+        n_past = n_keep;
+    }
+
+    return result;
+}
+
 int main(int argc, char ** argv) {
     std::setlocale(LC_NUMERIC, "C");
 
@@ -75,6 +270,17 @@ int main(int argc, char ** argv) {
     if (params.speculative.mparams_dft.path.empty()) {
         LOG_ERR("%s: --model-draft is required\n", __func__);
         return 1;
+    }
+
+    const bool use_tree = env_flag("LLAMA_GEMMA4_DRAFT_TREE");
+    const int tree_width = std::max(1, env_int("LLAMA_GEMMA4_TREE_WIDTH", 2));
+    const int tree_depth = std::max(0, env_int("LLAMA_GEMMA4_TREE_DEPTH", 2));
+    const int tree_plain_tail = std::max(0, env_int("LLAMA_GEMMA4_TREE_PLAIN_TAIL", 8));
+
+    if (use_tree) {
+        const int tree_seq_budget = std::max(1, tree_width * std::max(1, tree_depth));
+        params.n_parallel = std::max(params.n_parallel, tree_seq_budget);
+        params.n_batch = std::max(params.n_batch, tree_width * (tree_depth + 2) + tree_plain_tail + 8);
     }
 
     // init llama.cpp
@@ -185,12 +391,9 @@ int main(int argc, char ** argv) {
 
     common_speculative_begin(spec, prompt_tgt);
 
-    llama_batch batch_tgt = llama_batch_init(llama_n_batch(ctx_tgt), 0, 1);
-
-    const bool use_tree = env_flag("LLAMA_GEMMA4_DRAFT_TREE");
-    const int tree_width = std::max(1, env_int("LLAMA_GEMMA4_TREE_WIDTH", 2));
-    const int tree_depth = std::max(0, env_int("LLAMA_GEMMA4_TREE_DEPTH", 2));
-    const int tree_plain_tail = std::max(0, env_int("LLAMA_GEMMA4_TREE_PLAIN_TAIL", 8));
+    const int batch_cap = std::max<int>(llama_n_batch(ctx_tgt), tree_width * (tree_depth + 2) + tree_plain_tail + 8);
+    llama_batch batch_tgt = llama_batch_init(batch_cap, 0, std::max(1, params.n_parallel));
+    llama_memory_t mem_tgt = llama_get_memory(ctx_tgt);
 
     if (use_tree) {
         if (!sampling_is_greedy(params.sampling)) {
@@ -249,109 +452,93 @@ int main(int argc, char ** argv) {
             } else {
                 common_speculative_commit_tree_token(spec, id_last);
 
-                bool stop_tree = false;
-                for (int depth = 0; depth < tree_depth; ++depth) {
-                    const auto level = common_speculative_preview_tree_level(spec, tree_width);
-                    if (level.expects_seed) {
-                        throw std::runtime_error("tree speculative backend returned a seed level after seed commit");
-                    }
-                    if (level.candidates.empty()) {
-                        break;
-                    }
+                const auto tree = common_speculative_preview_tree(spec, tree_width, tree_depth);
+                std::unique_ptr<common_sampler, decltype(&common_sampler_free)> tree_smpl(
+                        common_sampler_clone(smpl),
+                        common_sampler_free);
+                const llama_token predicted_seed = common_sampler_sample(tree_smpl.get(), ctx_tgt, -1);
 
-                    draft_count += (int) level.candidates.size();
-                    n_drafted += (int) level.candidates.size();
-
-                    const llama_token predicted = sample_and_accept_current(smpl, ctx_tgt);
-                    const auto match = std::find_if(
-                            level.candidates.begin(),
-                            level.candidates.end(),
-                            [predicted](const common_speculative_tree_candidate & candidate) {
-                                return candidate.token == predicted;
-                            });
-
-                    if (match == level.candidates.end()) {
-                        common_speculative_discard(spec);
-                        common_speculative_accept_committed(spec, { predicted });
-                        ids.push_back(predicted);
-                        decode_target({ predicted }, false);
-                        stop_tree = true;
-                        break;
-                    }
-
-                    common_speculative_commit_tree_token(spec, predicted);
-                    ids.push_back(predicted);
-                    n_accept += 1;
-                    decode_target({ predicted }, false);
+                tree_verify_result tree_result;
+                if (predicted_seed != tree.seed_token) {
+                    common_speculative_discard(spec);
+                    tree_result.proposed = 1 + (int) tree.nodes.size();
+                    tree_result.ids = { predicted_seed };
+                    tree_result.next_token = predicted_seed;
+                } else {
+                    tree_result = verify_tree_batched(ctx_tgt, batch_tgt, mem_tgt, tree_smpl.get(), vocab, n_past, tree);
                 }
 
-                bool used_tail = false;
-                if (!stop_tree && tree_plain_tail > 0) {
-                    const int remaining = std::max(0, params_spec.n_max - (int) ids.size());
-                    const int tail_cap = std::min(tree_plain_tail, remaining);
-                    if (tail_cap > 0) {
-                        llama_tokens draft_tail = common_speculative_draft_plain(spec, tail_cap);
-                        if (draft_tail.size() < (size_t) params_spec.n_min) {
-                            common_speculative_discard(spec);
-                        } else if (!draft_tail.empty()) {
-                            draft_count += (int) draft_tail.size();
-                            n_drafted += (int) draft_tail.size();
-                            const llama_token first_tail = sample_and_accept_current(smpl, ctx_tgt);
-                            if (first_tail != draft_tail.front()) {
+                draft_count += tree_result.proposed;
+                n_drafted += tree_result.proposed;
+                n_accept += tree_result.accepted_from_draft;
+
+                if (tree_result.accepted_from_draft == 0) {
+                    common_speculative_discard(spec);
+                    ids = tree_result.ids;
+                } else {
+                    common_speculative_commit_tree_node(spec, tree_result.committed_node_id);
+                    ids.assign(tree_result.ids.begin(), tree_result.ids.end() - 1);
+
+                    bool used_tail = false;
+                    if (tree_plain_tail > 0) {
+                        const int remaining = std::max(0, params_spec.n_max - tree_result.accepted_from_draft);
+                        const int tail_cap = std::min(tree_plain_tail, remaining);
+                        if (tail_cap > 0) {
+                            llama_tokens draft_tail = common_speculative_draft_plain(spec, tail_cap);
+                            if (draft_tail.size() < (size_t) params_spec.n_min) {
                                 common_speculative_discard(spec);
-                                ids.push_back(first_tail);
-                            } else {
-                                const int n_past_tail = n_past;
-                                common_batch_clear(batch_tgt);
-                                for (size_t i = 0; i < draft_tail.size(); ++i) {
-                                    common_batch_add(batch_tgt, draft_tail[i], n_past + (int) i, { 0 }, true);
-                                }
-                                if (llama_decode(ctx_tgt, batch_tgt) != 0) {
-                                    throw std::runtime_error("llama_decode failed");
-                                }
-                                n_past += (int) draft_tail.size();
+                            } else if (!draft_tail.empty()) {
+                                draft_count += (int) draft_tail.size();
+                                n_drafted += (int) draft_tail.size();
 
-                                ids.push_back(first_tail);
-
-                                if (draft_tail.size() == 1) {
-                                    n_accept += 1;
-                                    common_speculative_accept_committed(spec, { first_tail });
-                                    n_past = n_past_tail + 1;
-                                    ids.push_back(sample_and_accept_current(smpl, ctx_tgt));
+                                if (tree_result.next_token != draft_tail.front()) {
+                                    common_speculative_discard(spec);
+                                    ids.push_back(tree_result.next_token);
                                 } else {
-                                    llama_tokens draft_suffix(draft_tail.begin() + 1, draft_tail.end());
-                                    std::vector<int> idxs(draft_tail.size());
-                                    for (size_t i = 0; i < idxs.size(); ++i) {
-                                        idxs[i] = (int) i;
+                                    const int n_past_tail = n_past;
+                                    common_batch_clear(batch_tgt);
+                                    for (size_t i = 0; i < draft_tail.size(); ++i) {
+                                        common_batch_add(batch_tgt, draft_tail[i], n_past + (int) i, { 0 }, true);
+                                    }
+                                    if (llama_decode(ctx_tgt, batch_tgt) != 0) {
+                                        throw std::runtime_error("llama_decode failed");
                                     }
 
-                                    const auto ids_suffix = common_sampler_sample_and_accept_n(smpl, ctx_tgt, idxs, draft_suffix);
-                                    size_t accepted_suffix = 0;
-                                    while (accepted_suffix < draft_suffix.size() &&
-                                           accepted_suffix < ids_suffix.size() &&
-                                           ids_suffix[accepted_suffix] == draft_suffix[accepted_suffix]) {
-                                        accepted_suffix++;
+                                    size_t accepted_tail = 1;
+                                    common_sampler_accept(tree_smpl.get(), draft_tail[0], true);
+                                    llama_token next_tail = tree_result.next_token;
+                                    for (size_t i = 1; i < draft_tail.size(); ++i) {
+                                        next_tail = common_sampler_sample(tree_smpl.get(), ctx_tgt, (int32_t) (i - 1));
+                                        if (next_tail != draft_tail[i]) {
+                                            break;
+                                        }
+                                        accepted_tail += 1;
+                                        common_sampler_accept(tree_smpl.get(), draft_tail[i], true);
+                                    }
+                                    if (accepted_tail == draft_tail.size()) {
+                                        next_tail = common_sampler_sample(tree_smpl.get(), ctx_tgt, (int32_t) (draft_tail.size() - 1));
                                     }
 
-                                    const size_t accepted_tail = 1 + accepted_suffix;
                                     n_accept += (int) accepted_tail;
                                     n_past = n_past_tail + (int) accepted_tail;
                                     llama_tokens committed_tail(draft_tail.begin(), draft_tail.begin() + (ptrdiff_t) accepted_tail);
                                     common_speculative_accept_committed(spec, committed_tail);
-                                    ids.insert(ids.end(), ids_suffix.begin(), ids_suffix.end());
+                                    ids.insert(ids.end(), committed_tail.begin(), committed_tail.end());
+                                    ids.push_back(next_tail);
+                                    llama_memory_seq_rm(mem_tgt, 0, n_past, -1);
                                 }
+                                used_tail = true;
                             }
-                            used_tail = true;
                         }
+                    }
+
+                    if (!used_tail) {
+                        ids.push_back(tree_result.next_token);
                     }
                 }
 
-                if (!used_tail) {
-                    if (!stop_tree) {
-                        common_speculative_discard(spec);
-                    }
-                    const llama_token next = sample_and_accept_current(smpl, ctx_tgt);
-                    ids.push_back(next);
+                for (llama_token token : ids) {
+                    common_sampler_accept(smpl, token, true);
                 }
             }
         } else {

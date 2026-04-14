@@ -171,6 +171,26 @@ struct gemma_external_draft_backend {
         uint64_t draft_mtp_ns = 0;
     };
 
+    struct sgd_tree_node {
+        uint32_t node_id = 0;
+        uint32_t parent_id = 0;
+        uint32_t token = 0;
+        uint32_t depth = 0;
+        float score = 0.0f;
+        float mtp_logprob = 0.0f;
+        float base_logprob = 0.0f;
+    };
+
+    struct sgd_tree_stats {
+        uint32_t seed_token = 0;
+        uint64_t returned_nodes = 0;
+        uint64_t max_width = 0;
+        uint64_t max_depth = 0;
+        uint64_t draft_build_ns = 0;
+        uint64_t draft_decode_ns = 0;
+        uint64_t draft_mtp_ns = 0;
+    };
+
     using sgd_engine_open_fn = int (*)(const char *, SgdEngine **);
     using sgd_engine_close_fn = int (*)(SgdEngine *);
     using sgd_session_open_fn = int (*)(SgdEngine *, const uint32_t *, size_t, SgdSession **);
@@ -178,6 +198,8 @@ struct gemma_external_draft_backend {
     using sgd_session_draft_fn = int (*)(SgdSession *, int, size_t, uint32_t *, size_t, size_t *, sgd_draft_stats *);
     using sgd_session_accept_fn = int (*)(SgdSession *, const uint32_t *, size_t);
     using sgd_session_append_prompt_fn = int (*)(SgdSession *, const uint32_t *, size_t);
+    using sgd_session_preview_tree_fn = int (*)(SgdSession *, size_t, size_t, sgd_tree_node *, size_t, size_t *, sgd_tree_stats *);
+    using sgd_session_commit_tree_node_fn = int (*)(SgdSession *, uint32_t);
     using sgd_session_preview_tree_level_fn = int (*)(SgdSession *, size_t, sgd_tree_level_candidate *, size_t, size_t *, sgd_tree_level_stats *);
     using sgd_session_commit_tree_token_fn = int (*)(SgdSession *, uint32_t);
     using sgd_session_discard_preview_fn = int (*)(SgdSession *);
@@ -196,6 +218,8 @@ struct gemma_external_draft_backend {
     sgd_session_draft_fn session_draft = nullptr;
     sgd_session_accept_fn session_accept = nullptr;
     sgd_session_append_prompt_fn session_append_prompt = nullptr;
+    sgd_session_preview_tree_fn session_preview_tree = nullptr;
+    sgd_session_commit_tree_node_fn session_commit_tree_node = nullptr;
     sgd_session_preview_tree_level_fn session_preview_tree_level = nullptr;
     sgd_session_commit_tree_token_fn session_commit_tree_token = nullptr;
     sgd_session_discard_preview_fn session_discard_preview = nullptr;
@@ -256,6 +280,8 @@ struct gemma_external_draft_backend {
         session_draft = load_symbol<sgd_session_draft_fn>("sgd_session_draft");
         session_accept = load_symbol<sgd_session_accept_fn>("sgd_session_accept");
         session_append_prompt = load_symbol<sgd_session_append_prompt_fn>("sgd_session_append_prompt");
+        session_preview_tree = load_symbol<sgd_session_preview_tree_fn>("sgd_session_preview_tree");
+        session_commit_tree_node = load_symbol<sgd_session_commit_tree_node_fn>("sgd_session_commit_tree_node");
         session_preview_tree_level = load_symbol<sgd_session_preview_tree_level_fn>("sgd_session_preview_tree_level");
         session_commit_tree_token = load_symbol<sgd_session_commit_tree_token_fn>("sgd_session_commit_tree_token");
         session_discard_preview = load_symbol<sgd_session_discard_preview_fn>("sgd_session_discard_preview");
@@ -348,7 +374,45 @@ struct gemma_external_draft_backend {
     }
 
     bool supports_tree() const {
-        return session_preview_tree_level != nullptr && session_commit_tree_token != nullptr;
+        return session_preview_tree != nullptr &&
+               session_commit_tree_node != nullptr &&
+               session_preview_tree_level != nullptr &&
+               session_commit_tree_token != nullptr;
+    }
+
+    common_speculative_tree preview_tree(int max_width, int max_depth) {
+        if (session == nullptr) {
+            throw std::runtime_error("draft session is not initialized");
+        }
+        const size_t cap = (size_t) std::max(1, max_width * std::max(1, max_depth) * std::max(1, max_width));
+        std::vector<sgd_tree_node> nodes(cap);
+        size_t out_len = 0;
+        sgd_tree_stats stats{};
+        check(session_preview_tree(session, (size_t) std::max(1, max_width), (size_t) std::max(1, max_depth), nodes.data(), nodes.size(), &out_len, &stats), "sgd_session_preview_tree");
+        nodes.resize(out_len);
+
+        common_speculative_tree out;
+        out.seed_token = (llama_token) stats.seed_token;
+        out.nodes.reserve(nodes.size());
+        for (const auto & node : nodes) {
+            out.nodes.push_back(common_speculative_tree_node{
+                node.node_id,
+                node.parent_id,
+                (llama_token) node.token,
+                node.depth,
+                node.score,
+                node.mtp_logprob,
+                node.base_logprob,
+            });
+        }
+        return out;
+    }
+
+    void commit_tree_node(uint32_t node_id) {
+        if (session == nullptr) {
+            throw std::runtime_error("draft session is not initialized");
+        }
+        check(session_commit_tree_node(session, node_id), "sgd_session_commit_tree_node");
     }
 
     common_speculative_tree_level preview_tree_level(int max_width) {
@@ -446,9 +510,18 @@ struct common_speculative_state {
     }
     virtual void discard() {}
     virtual bool supports_tree() const { return false; }
+    virtual common_speculative_tree preview_tree(int max_width, int max_depth) {
+        GGML_UNUSED(max_width);
+        GGML_UNUSED(max_depth);
+        throw std::runtime_error("tree preview not supported by this speculative backend");
+    }
     virtual common_speculative_tree_level preview_tree_level(int max_width) {
         GGML_UNUSED(max_width);
         throw std::runtime_error("tree preview not supported by this speculative backend");
+    }
+    virtual void commit_tree_node(uint32_t node_id) {
+        GGML_UNUSED(node_id);
+        throw std::runtime_error("tree commit node not supported by this speculative backend");
     }
     virtual void commit_tree_token(llama_token token) {
         GGML_UNUSED(token);
@@ -818,11 +891,27 @@ struct common_speculative_state_draft : public common_speculative_state {
         return ext_draft && gemma_external_tree_enabled() && ext_draft->supports_tree();
     }
 
+    common_speculative_tree preview_tree(int max_width, int max_depth) override {
+        if (!supports_tree()) {
+            return common_speculative_state::preview_tree(max_width, max_depth);
+        }
+        return ext_draft->preview_tree(max_width, max_depth);
+    }
+
     common_speculative_tree_level preview_tree_level(int max_width) override {
         if (!supports_tree()) {
             return common_speculative_state::preview_tree_level(max_width);
         }
         return ext_draft->preview_tree_level(max_width);
+    }
+
+    void commit_tree_node(uint32_t node_id) override {
+        if (!supports_tree()) {
+            common_speculative_state::commit_tree_node(node_id);
+            return;
+        }
+        ext_draft->commit_tree_node(node_id);
+        ext_pending_seed.reset();
     }
 
     void commit_tree_token(llama_token token) override {
@@ -1545,6 +1634,23 @@ bool common_speculative_supports_tree(common_speculative * spec) {
     return common_speculative_find_tree_impl(spec) != nullptr;
 }
 
+common_speculative_tree common_speculative_preview_tree(common_speculative * spec, int max_width, int max_depth) {
+    auto * impl = common_speculative_find_tree_impl(spec);
+    if (impl == nullptr) {
+        throw std::runtime_error("tree speculative backend is not available");
+    }
+    spec->curr_impl = impl;
+    common_speculative_tree result;
+    {
+        common_time_meas tm(impl->t_draft_us, !impl->gen_perf);
+        result = impl->preview_tree(max_width, max_depth);
+        impl->n_call_draft++;
+    }
+    impl->n_gen_drafts++;
+    impl->n_gen_tokens += result.nodes.size();
+    return result;
+}
+
 common_speculative_tree_level common_speculative_preview_tree_level(common_speculative * spec, int max_width) {
     auto * impl = common_speculative_find_tree_impl(spec);
     if (impl == nullptr) {
@@ -1560,6 +1666,15 @@ common_speculative_tree_level common_speculative_preview_tree_level(common_specu
     impl->n_gen_drafts++;
     impl->n_gen_tokens += result.candidates.size();
     return result;
+}
+
+void common_speculative_commit_tree_node(common_speculative * spec, uint32_t node_id) {
+    auto * impl = common_speculative_find_tree_impl(spec);
+    if (impl == nullptr) {
+        throw std::runtime_error("tree speculative backend is not available");
+    }
+    spec->curr_impl = impl;
+    impl->commit_tree_node(node_id);
 }
 
 void common_speculative_commit_tree_token(common_speculative * spec, llama_token token) {

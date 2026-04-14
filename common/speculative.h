@@ -17,6 +17,21 @@ struct common_speculative_tree_level {
     std::vector<common_speculative_tree_candidate> candidates;
 };
 
+struct common_speculative_tree_node {
+    uint32_t node_id = 0;
+    uint32_t parent_id = 0;
+    llama_token token = 0;
+    uint32_t depth = 0;
+    float score = 0.0f;
+    float mtp_logprob = 0.0f;
+    float base_logprob = 0.0f;
+};
+
+struct common_speculative_tree {
+    llama_token seed_token = 0;
+    std::vector<common_speculative_tree_node> nodes;
+};
+
 // comma separated list of all types
 std::string common_speculative_type_name_str();
 
@@ -53,7 +68,9 @@ void common_speculative_accept_tokens(common_speculative * spec, const llama_tok
 void common_speculative_accept_committed(common_speculative * spec, const llama_tokens & committed_tokens);
 void common_speculative_discard(common_speculative * spec);
 bool common_speculative_supports_tree(common_speculative * spec);
+common_speculative_tree common_speculative_preview_tree(common_speculative * spec, int max_width, int max_depth);
 common_speculative_tree_level common_speculative_preview_tree_level(common_speculative * spec, int max_width);
+void common_speculative_commit_tree_node(common_speculative * spec, uint32_t node_id);
 void common_speculative_commit_tree_token(common_speculative * spec, llama_token token);
 llama_tokens common_speculative_draft_plain(common_speculative * spec, int max_tokens);
 
