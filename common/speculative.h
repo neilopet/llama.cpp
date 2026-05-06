@@ -20,6 +20,8 @@ common_speculative * common_speculative_init(
 
 void common_speculative_free(common_speculative * spec);
 
+void common_speculative_set_enabled(common_speculative * spec, bool enabled);
+
 // optionally call once at the beginning of a new generation
 void common_speculative_begin(common_speculative * spec, const llama_tokens & prompt);
 

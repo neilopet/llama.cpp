@@ -123,6 +123,7 @@ static bool common_speculative_are_compatible(
 // in a subclass of common_speculative_state
 struct common_speculative_state {
     const enum common_speculative_type type;
+    bool enabled = true;
 
     size_t n_call_begin  = 0; // number of times this implementation was called for refresh.
     size_t n_call_draft  = 0; // number of times this implementation was called for generation.
@@ -143,6 +144,10 @@ struct common_speculative_state {
     common_speculative_state(enum common_speculative_type type) : type(type) {}
 
     virtual ~common_speculative_state() = default;
+
+    virtual void set_enabled(bool enabled_in) {
+        enabled = enabled_in;
+    }
 
     virtual void begin(const llama_tokens & prompt) = 0;
 
@@ -636,11 +641,11 @@ struct common_speculative_state_mtp : public common_speculative_state {
         batch.seq_id[0][0] = 0;
         batch.logits[0]    = 1;
 
-        llama_set_mtp(ctx_tgt, ctx_mtp);
+        set_enabled(false);
     }
 
     ~common_speculative_state_mtp() override {
-        llama_set_mtp(ctx_tgt, nullptr);
+        set_enabled(false);
         llama_batch_free(batch);
         common_sampler_free(smpl);
         if (ctx_mtp) {
@@ -648,7 +653,32 @@ struct common_speculative_state_mtp : public common_speculative_state {
         }
     }
 
+    void set_enabled(bool enabled_in) override {
+        if (enabled == enabled_in) {
+            return;
+        }
+
+        enabled = enabled_in;
+        llama_set_mtp(ctx_tgt, enabled ? ctx_mtp : nullptr);
+
+        if (ctx_mtp) {
+            llama_memory_clear(llama_get_memory(ctx_mtp), true);
+            llama_synchronize(ctx_mtp);
+        }
+
+        last_n_accepted = -1;
+        last_n_drafted  = 0;
+
+        if (smpl) {
+            common_sampler_reset(smpl);
+        }
+    }
+
     void begin(const llama_tokens & prompt) override {
+        if (!enabled) {
+            return;
+        }
+
         last_n_accepted = -1;
         last_n_drafted  = 0;
 
@@ -670,6 +700,11 @@ struct common_speculative_state_mtp : public common_speculative_state {
             const llama_tokens & prompt_tgt,
             llama_token id_last,
             llama_tokens & draft_tokens) override {
+        if (!enabled) {
+            draft_tokens.clear();
+            return;
+        }
+
         GGML_UNUSED(prompt_tgt);
         draft_tokens.clear();
 
@@ -741,6 +776,10 @@ struct common_speculative_state_mtp : public common_speculative_state {
     }
 
     void accept(uint16_t n_accepted) override {
+        if (!enabled) {
+            return;
+        }
+
         const llama_pos pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_mtp), 0);
         const int32_t n_drafted_last = (int32_t) last_n_drafted;
         const int32_t n_to_drop = std::max(0, n_drafted_last - (int32_t) n_accepted - 1);
@@ -1306,6 +1345,16 @@ void common_speculative_free(common_speculative * spec) {
     }
 
     delete spec;
+}
+
+void common_speculative_set_enabled(common_speculative * spec, bool enabled) {
+    if (spec == nullptr) {
+        return;
+    }
+
+    for (auto & impl : spec->impls) {
+        impl->set_enabled(enabled);
+    }
 }
 
 void common_speculative_begin(common_speculative * spec, const llama_tokens & prompt) {

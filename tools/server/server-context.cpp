@@ -82,6 +82,7 @@ struct server_slot {
 
     llama_context * ctx = nullptr;
 
+    bool is_mtp_route   = false;
     bool is_mtp_enabled = false;
 
     common_context_seq_rm_type ctx_seq_rm_type = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
@@ -159,9 +160,9 @@ struct server_slot {
         return res;
     }
 
-    bool is_mtp() const { return is_mtp_enabled; }
+    bool is_mtp() const { return is_mtp_route; }
 
-    bool need_embd() const { return task->need_embd() || is_mtp(); }
+    bool need_embd() const { return task->need_embd() || is_mtp_enabled; }
 
     void prompt_clear(bool allow_processing) {
         if (!allow_processing) {
@@ -224,6 +225,7 @@ struct server_slot {
         // clear speculative decoding stats
         n_draft_total = 0;
         n_draft_accepted = 0;
+        is_mtp_enabled = false;
 
         task_prev = std::move(task);
         task.reset();
@@ -297,7 +299,7 @@ struct server_slot {
     }
 
     bool can_speculate() const {
-        return !!spec;
+        return !!spec && (!is_mtp_route || is_mtp_enabled);
     }
 
     void add_token(const completion_token_output & token) {
@@ -968,8 +970,13 @@ private:
 
             // try speculative decoding
             if (ctx_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_NO) {
-                slot.is_mtp_enabled = params_base.speculative.has_mtp();
+                slot.is_mtp_route   = params_base.speculative.has_mtp();
+                slot.is_mtp_enabled = false;
                 slot.spec.reset(common_speculative_init(params_base.speculative, slot.ctx));
+
+                if (slot.spec && slot.is_mtp()) {
+                    common_speculative_set_enabled(slot.spec.get(), slot.is_mtp_enabled);
+                }
 
                 if (slot.spec) {
                     SLT_INF(slot, "%s", "speculative decoding context initialized\n");
@@ -1363,6 +1370,27 @@ private:
         if (!task.tokens.validate(ctx)) {
             send_error(task, "Prompt contains invalid tokens", ERROR_TYPE_INVALID_REQUEST);
             return false;
+        }
+
+        const bool task_has_media = task.tokens.has_media();
+
+        if (slot.is_mtp()) {
+            if (!task_has_media && slot.prompt.tokens.has_media()) {
+                SLT_WRN(slot, "%s\n", "clearing multimodal slot state before enabling MTP for a text-only task");
+                slot.prompt_clear(false);
+            }
+
+            slot.is_mtp_enabled = !task_has_media;
+
+            if (slot.spec) {
+                common_speculative_set_enabled(slot.spec.get(), slot.is_mtp_enabled);
+            }
+
+            if (task_has_media) {
+                SLT_INF(slot, "%s\n", "disabling MTP for multimodal task");
+            } else {
+                SLT_INF(slot, "%s\n", "enabling MTP for text-only task");
+            }
         }
 
         SLT_DBG(slot, "launching slot : %s\n", safe_json_to_str(slot.to_json()).c_str());
@@ -2272,7 +2300,7 @@ private:
                 // add generated tokens to cache
                 // ref: https://github.com/ggml-org/llama.cpp/pull/16818#discussion_r2473269481
                 {
-                    GGML_ASSERT(!slot.prompt.tokens.has_mtmd);
+                    GGML_ASSERT(!slot.prompt.tokens.has_media());
 
                     llama_tokens new_tokens = slot.prompt.tokens.get_tokens(); // copy
                     for (size_t i = n_keep + n_discard; i < new_tokens.size(); i++) {
@@ -2439,7 +2467,7 @@ private:
 
                                 const bool can_cache_reuse =
                                     llama_memory_can_shift(llama_get_memory(ctx)) &&
-                                    !slot.prompt.tokens.has_mtmd &&
+                                    !slot.prompt.tokens.has_media() &&
                                     // MTP slots: per-request n_cache_reuse can re-enable
                                     // the path even though we disabled the global flag at
                                     // startup. The cache-shift uses llama_memory_seq_add
@@ -2452,12 +2480,12 @@ private:
 
                                 // reuse chunks from the cached prompt by shifting their KV cache in the new position
                                 if (can_cache_reuse && n_cache_reuse > 0) {
-                                    GGML_ASSERT(!slot.prompt.tokens.has_mtmd);
+                                    GGML_ASSERT(!slot.prompt.tokens.has_media());
 
                                     size_t head_c = n_past; // cache
                                     size_t head_p = n_past; // current prompt
 
-                                    if (mctx) {
+                                    if (slot.prompt.tokens.has_media()) {
                                         // we should never reach this
                                         GGML_ABORT("not supported by multimodal");
                                     }
