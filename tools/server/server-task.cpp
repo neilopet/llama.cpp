@@ -77,6 +77,7 @@ json task_params::to_json(bool only_metrics) const {
             {"generation_prompt",         chat_parser_params.generation_prompt},
             {"samplers",                  samplers},
             {"speculative.type",          common_speculative_type_to_str(speculative.type)},
+            {"speculative.mtp.multimodal", speculative.mtp.allow_multimodal},
             {"timings_per_token",         timings_per_token},
             {"post_sampling_probs",       post_sampling_probs},
             {"backend_sampling",          sampling.backend_sampling},
@@ -134,6 +135,7 @@ json task_params::to_json(bool only_metrics) const {
         {"generation_prompt",         chat_parser_params.generation_prompt},
         {"samplers",                  samplers},
         {"speculative.type",          common_speculative_type_to_str(speculative.type)},
+        {"speculative.mtp.multimodal", speculative.mtp.allow_multimodal},
         {"timings_per_token",         timings_per_token},
         {"post_sampling_probs",       post_sampling_probs},
         {"backend_sampling",          sampling.backend_sampling},
@@ -300,6 +302,7 @@ task_params server_task::params_from_json_cmpl(
     params.speculative.draft.n_min = json_value(data, "speculative.n_min", defaults.speculative.draft.n_min);
     params.speculative.draft.n_max = json_value(data, "speculative.n_max", defaults.speculative.draft.n_max);
     params.speculative.draft.p_min = json_value(data, "speculative.p_min", defaults.speculative.draft.p_min);
+    params.speculative.mtp.allow_multimodal = json_value(data, "speculative.mtp.multimodal", defaults.speculative.mtp.allow_multimodal);
 
     params.speculative.draft.n_min = std::min(params.speculative.draft.n_max, params.speculative.draft.n_min);
     params.speculative.draft.n_min = std::max(params.speculative.draft.n_min, 0);

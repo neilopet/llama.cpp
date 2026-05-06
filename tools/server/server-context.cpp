@@ -1380,6 +1380,11 @@ private:
                 slot.prompt_clear(false);
             }
 
+            if (task_has_media && task.params.speculative.mtp.allow_multimodal) {
+                SLT_WRN(slot, "%s\n",
+                        "multimodal MTP was requested but true multimodal MTP is not implemented; disabling MTP for this task");
+            }
+
             slot.is_mtp_enabled = !task_has_media;
 
             if (slot.spec) {

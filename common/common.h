@@ -351,6 +351,10 @@ struct common_params_speculative_ngram_cache {
 struct common_params_speculative_mtp {
     llama_model        * model = nullptr;
     llama_context_params cparams;
+
+    // Experimental only. The server still defaults to per-request guarded MTP:
+    // text-only requests can draft, requests with media run without MTP.
+    bool allow_multimodal = false;
 };
 
 struct common_params_speculative {
