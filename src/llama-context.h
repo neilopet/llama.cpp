@@ -90,6 +90,7 @@ struct llama_context {
 
     void            set_mtp(llama_context * ctx_mtp_in);
     llama_context * get_mtp() const { return mtp.ctx_mtp; }
+    void            mtp_reset_pending_after(llama_pos p0);
 
     llama_token * get_sampled_tokens() const;
     llama_token   get_sampled_token_ith(int32_t idx);
@@ -260,6 +261,8 @@ private:
             int32_t                n_tokens,
             const llama_token    * tokens,
             const llama_pos      * positions,
+            uint32_t               n_pos,
+            struct ggml_tensor   * t_inp_embd,
             struct ggml_tensor   * t_h_pre_norm);
 
     // TODO: read/write lora adapters and cvec

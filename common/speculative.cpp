@@ -151,6 +151,11 @@ struct common_speculative_state {
 
     virtual void begin(const llama_tokens & prompt) = 0;
 
+    virtual bool begin_from_pos(llama_pos pos_max) {
+        GGML_UNUSED(pos_max);
+        return true;
+    }
+
     virtual void draft(
             const common_params_speculative & params,
             const llama_tokens & prompt_tgt,
@@ -612,7 +617,8 @@ struct common_speculative_state_mtp : public common_speculative_state {
 
     llama_batch       batch;       // single token draft step
     common_sampler  * smpl = nullptr;
-    int32_t           n_embd = 0;
+    int32_t           n_embd_hidden = 0;
+    llama_pos         next_pos = -1;
 
     uint16_t last_n_drafted  = 0;
     int32_t  last_n_accepted = -1;
@@ -623,7 +629,7 @@ struct common_speculative_state_mtp : public common_speculative_state {
         : common_speculative_state(type), ctx_tgt(ctx_tgt), ctx_mtp(ctx_mtp) {
         GGML_ASSERT(ctx_tgt && ctx_mtp);
         const llama_model * model_mtp = llama_get_model(ctx_mtp);
-        n_embd = llama_model_n_embd(model_mtp);
+        n_embd_hidden = llama_model_n_embd(model_mtp);
 
         {
             common_params_sampling sparams;
@@ -634,7 +640,7 @@ struct common_speculative_state_mtp : public common_speculative_state {
         }
 
         // TODO: multiple seq support
-        batch = llama_batch_init(/*n_tokens=*/ 1, /*embd=*/ n_embd, /*n_seq_max=*/ 1);
+        batch = llama_batch_init(/*n_tokens=*/ 1, /*embd=*/ n_embd_hidden, /*n_seq_max=*/ 1);
         batch.token = (llama_token *) malloc(sizeof(llama_token));
         batch.n_tokens     = 1;
         batch.n_seq_id[0]  = 1;
@@ -668,6 +674,7 @@ struct common_speculative_state_mtp : public common_speculative_state {
 
         last_n_accepted = -1;
         last_n_drafted  = 0;
+        next_pos         = -1;
 
         if (smpl) {
             common_sampler_reset(smpl);
@@ -681,6 +688,7 @@ struct common_speculative_state_mtp : public common_speculative_state {
 
         last_n_accepted = -1;
         last_n_drafted  = 0;
+        next_pos         = -1;
 
         const int32_t N = (int32_t) prompt.size();
         if (N <= 0) {
@@ -693,6 +701,28 @@ struct common_speculative_state_mtp : public common_speculative_state {
                     "have logits=true. Drafts may degrade.\n",
                     __func__, (int) pos_max, N - 1);
         }
+    }
+
+    bool begin_from_pos(llama_pos pos_max_expected) override {
+        if (!enabled) {
+            return false;
+        }
+
+        last_n_accepted = -1;
+        last_n_drafted  = 0;
+        next_pos         = pos_max_expected + 1;
+
+        const llama_pos pos_max_mtp = llama_memory_seq_pos_max(llama_get_memory(ctx_mtp), 0);
+        if (pos_max_expected > 0 && pos_max_mtp < 0) {
+            LOG_WRN("%s: ctx_mtp pos_max=%d while expected prompt pos_max=%d — disabling MTP for this multimodal decode\n",
+                    __func__, (int) pos_max_mtp, (int) pos_max_expected);
+            return false;
+        }
+
+        LOG_INF("%s: multimodal MTP begin: ctx_mtp pos_max=%d, logical prompt pos_max=%d, next draft pos=%d\n",
+                __func__, (int) pos_max_mtp, (int) pos_max_expected, (int) next_pos);
+
+        return true;
     }
 
     void draft(
@@ -724,10 +754,11 @@ struct common_speculative_state_mtp : public common_speculative_state {
         }
 
         const int32_t n_max     = std::max(1, params.draft.n_max);
-        const size_t  row_bytes = (size_t) n_embd * sizeof(float);
+        const size_t  row_bytes     = (size_t) n_embd_hidden * sizeof(float);
 
         llama_token cond_tok = id_last;
-        llama_pos   pos      = llama_memory_seq_pos_max(llama_get_memory(ctx_mtp), 0) + 1;
+        llama_pos   pos      = next_pos >= 0 ? next_pos : llama_memory_seq_pos_max(llama_get_memory(ctx_mtp), 0) + 1;
+        next_pos = -1;
 
         // auto-regressive loop for MTP
         for (int32_t k = 0; k < n_max; ++k) {
@@ -1367,6 +1398,21 @@ void common_speculative_begin(common_speculative * spec, const llama_tokens & pr
         impl->begin(prompt);
         impl->n_call_begin++;
     }
+}
+
+bool common_speculative_begin_from_pos(common_speculative * spec, llama_pos pos_max) {
+    if (spec == nullptr) {
+        return false;
+    }
+
+    bool ok = true;
+    for (auto & impl : spec->impls) {
+        common_time_meas tm(impl->t_begin_us, !impl->gen_perf);
+        ok = impl->begin_from_pos(pos_max) && ok;
+        impl->n_call_begin++;
+    }
+
+    return ok;
 }
 
 llama_tokens common_speculative_draft(

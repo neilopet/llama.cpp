@@ -24,6 +24,7 @@ void common_speculative_set_enabled(common_speculative * spec, bool enabled);
 
 // optionally call once at the beginning of a new generation
 void common_speculative_begin(common_speculative * spec, const llama_tokens & prompt);
+bool common_speculative_begin_from_pos(common_speculative * spec, llama_pos pos_max);
 
 // sample up to n_draft tokens and add them to the batch using the draft model
 llama_tokens common_speculative_draft(

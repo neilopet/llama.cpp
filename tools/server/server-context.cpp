@@ -83,7 +83,8 @@ struct server_slot {
     llama_context * ctx = nullptr;
 
     bool is_mtp_route   = false;
-    bool is_mtp_enabled = false;
+    bool is_mtp_registered = false; // ctx_mtp is attached and mirrors target decode
+    bool is_mtp_enabled    = false; // speculative drafting is allowed
 
     common_context_seq_rm_type ctx_seq_rm_type = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
 
@@ -162,7 +163,7 @@ struct server_slot {
 
     bool is_mtp() const { return is_mtp_route; }
 
-    bool need_embd() const { return task->need_embd() || is_mtp_enabled; }
+    bool need_embd() const { return task->need_embd() || is_mtp_registered; }
 
     void prompt_clear(bool allow_processing) {
         if (!allow_processing) {
@@ -225,6 +226,10 @@ struct server_slot {
         // clear speculative decoding stats
         n_draft_total = 0;
         n_draft_accepted = 0;
+        if (spec && is_mtp_route && is_mtp_registered) {
+            common_speculative_set_enabled(spec.get(), false);
+        }
+        is_mtp_registered = false;
         is_mtp_enabled = false;
 
         task_prev = std::move(task);
@@ -971,7 +976,8 @@ private:
             // try speculative decoding
             if (ctx_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_NO) {
                 slot.is_mtp_route   = params_base.speculative.has_mtp();
-                slot.is_mtp_enabled = false;
+                slot.is_mtp_registered = false;
+                slot.is_mtp_enabled    = false;
                 slot.spec.reset(common_speculative_init(params_base.speculative, slot.ctx));
 
                 if (slot.spec && slot.is_mtp()) {
@@ -1380,18 +1386,19 @@ private:
                 slot.prompt_clear(false);
             }
 
-            if (task_has_media && task.params.speculative.mtp.allow_multimodal) {
-                SLT_WRN(slot, "%s\n",
-                        "multimodal MTP was requested but true multimodal MTP is not implemented; disabling MTP for this task");
-            }
-
-            slot.is_mtp_enabled = !task_has_media;
+            slot.is_mtp_registered = slot.spec && (!task_has_media || task.params.speculative.mtp.allow_multimodal);
+            slot.is_mtp_enabled    = slot.spec && !task_has_media;
 
             if (slot.spec) {
-                common_speculative_set_enabled(slot.spec.get(), slot.is_mtp_enabled);
+                // Always transition through disabled at task start so ctx_mtp is
+                // cleared and the prompt is mirrored from the current request.
+                common_speculative_set_enabled(slot.spec.get(), false);
+                common_speculative_set_enabled(slot.spec.get(), slot.is_mtp_registered);
             }
 
-            if (task_has_media) {
+            if (task_has_media && slot.is_mtp_registered) {
+                SLT_INF(slot, "%s\n", "enabling multimodal MTP mirror-only prefill");
+            } else if (task_has_media) {
                 SLT_INF(slot, "%s\n", "disabling MTP for multimodal task");
             } else {
                 SLT_INF(slot, "%s\n", "enabling MTP for text-only task");
@@ -1417,7 +1424,8 @@ private:
             backend_sampling &= task.params.sampling.backend_sampling;
 
             // TODO: speculative decoding requires multiple samples per batch - not supported yet
-            backend_sampling &= !(slot.can_speculate() && common_speculative_n_max(slot.spec.get(), task.params.speculative) > 0);
+            const bool may_speculate = slot.can_speculate() || (slot.is_mtp() && slot.is_mtp_registered);
+            backend_sampling &= !(may_speculate && common_speculative_n_max(slot.spec.get(), task.params.speculative) > 0);
 
             // TODO: getting post/pre sampling logits is not yet supported with backend sampling
             backend_sampling &= !need_logits;
@@ -3027,7 +3035,20 @@ private:
                     // prompt evaluated for next-token prediction
                     slot.state = SLOT_STATE_GENERATING;
 
-                    if (slot.can_speculate()) {
+                    if (slot.is_mtp() && slot.is_mtp_registered && !slot.is_mtp_enabled) {
+                        const llama_pos pos_max = slot.prompt.tokens.pos_next() - 1;
+                        const bool mtp_ready = pos_max >= 0 &&
+                            common_speculative_begin_from_pos(slot.spec.get(), pos_max);
+                        if (mtp_ready) {
+                            slot.is_mtp_enabled = true;
+                            SLT_INF(slot, "multimodal MTP decode enabled after mirrored prefill (pos_max=%d)\n", (int) pos_max);
+                        } else {
+                            SLT_WRN(slot, "multimodal MTP mirror verification failed (pos_max=%d); falling back without speculation\n", (int) pos_max);
+                            common_speculative_set_enabled(slot.spec.get(), false);
+                            slot.is_mtp_registered = false;
+                            slot.is_mtp_enabled    = false;
+                        }
+                    } else if (slot.can_speculate()) {
                         common_speculative_begin(slot.spec.get(), slot.prompt.tokens.get_text_tokens());
                     }
                 } else if (slot.state != SLOT_STATE_GENERATING) {

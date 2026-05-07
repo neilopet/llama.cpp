@@ -14,6 +14,7 @@
 #include <cinttypes>
 #include <cmath>
 #include <cstring>
+#include <algorithm>
 #include <limits>
 #include <stdexcept>
 
@@ -391,7 +392,9 @@ llama_context::~llama_context() {
         }
     }
     if (mtp.hook_batch.pos != nullptr) {
+        mtp.hook_batch.token = mtp.hook_token;
         llama_batch_free(mtp.hook_batch);
+        mtp.hook_token = nullptr;
     }
     ggml_opt_free(opt_ctx);
 }
@@ -1250,6 +1253,8 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                 (int32_t) ubatch.n_tokens,
                 ubatch.token,
                 ubatch.pos,
+                ubatch.n_pos,
+                res->t_inp_embd,
                 res->t_h_pre_norm);
     }
 
@@ -1565,7 +1570,16 @@ int llama_context::decode(const llama_batch & batch_inp) {
     const auto & hparams = model.hparams;
 
     const int64_t n_vocab = vocab.n_tokens();
-    const int64_t n_embd  = hparams.n_embd_inp();
+    int64_t n_embd  = hparams.n_embd_inp();
+
+    if (batch_inp.embd && !batch_inp.token &&
+            (model.arch == LLM_ARCH_QWEN35_MTP || model.arch == LLM_ARCH_QWEN35MOE_MTP)) {
+        // Qwen MTP media mirroring needs a packed embedding row
+        // [e_input ; h_input]. The ordinary model embedding width is only
+        // hparams.n_embd_inp(), so tell the batch allocator to preserve the
+        // full 2*n_embd row stride for embedding-only MTP batches.
+        n_embd = 2 * (int64_t) hparams.n_embd;
+    }
 
     // when computing embeddings, all tokens are output
     const bool output_all   = cparams.embeddings;
@@ -3380,8 +3394,10 @@ void llama_context::set_mtp(llama_context * ctx_mtp_in) {
     if (mtp.ctx_mtp == ctx_mtp_in) return;
 
     if (mtp.hook_batch.pos != nullptr) {
+        mtp.hook_batch.token = mtp.hook_token;
         llama_batch_free(mtp.hook_batch);
         mtp.hook_batch = llama_batch{};
+        mtp.hook_token = nullptr;
     }
 
     mtp.ctx_mtp     = ctx_mtp_in;
@@ -3390,15 +3406,27 @@ void llama_context::set_mtp(llama_context * ctx_mtp_in) {
     if (mtp.ctx_mtp) {
         const int32_t n_ub   = (int32_t) cparams.n_ubatch;
         const int32_t n_embd = (int32_t) model.hparams.n_embd;
-        mtp.hook_batch       = llama_batch_init(n_ub, n_embd, 1);
-        mtp.hook_batch.token = (llama_token *) malloc(sizeof(llama_token) * n_ub);
+        mtp.hook_batch       = llama_batch_init(n_ub, 2*n_embd, 1);
+        mtp.hook_token       = (llama_token *) malloc(sizeof(llama_token) * n_ub);
+        mtp.hook_batch.token = mtp.hook_token;
+        if (model.hparams.n_pos_per_embd() > 1) {
+            free(mtp.hook_batch.pos);
+            mtp.hook_batch.pos = (llama_pos *) malloc(sizeof(llama_pos) * n_ub * model.hparams.n_pos_per_embd());
+        }
         mtp.pending_h.assign(n_embd, 0.0f);
-        LLAMA_LOG_INFO("%s: MTP draft head registered (ctx_mtp=%p, n_ubatch=%d, n_embd=%d)\n",
-                       __func__, (const void *) mtp.ctx_mtp, n_ub, n_embd);
+        LLAMA_LOG_INFO("%s: MTP draft head registered (ctx_mtp=%p, n_ubatch=%d, n_embd=%d, n_pos=%u)\n",
+                       __func__, (const void *) mtp.ctx_mtp, n_ub, n_embd, model.hparams.n_pos_per_embd());
     } else {
+        mtp.hook_token = nullptr;
         mtp.pending_h.clear();
         mtp.pending_h.shrink_to_fit();
         LLAMA_LOG_INFO("%s: MTP draft head unregistered\n", __func__);
+    }
+}
+
+void llama_context::mtp_reset_pending_after(llama_pos p0) {
+    if (p0 < 0 || mtp.pending_pos >= p0) {
+        mtp.pending_pos = -1;
     }
 }
 
@@ -3406,53 +3434,124 @@ void llama_context::handle_mtp_for_ubatch(
         int32_t                n_tokens,
         const llama_token    * tokens,
         const llama_pos      * positions,
-        struct ggml_tensor   * t) {
-    if (n_tokens == 0 || t == nullptr) {
+        uint32_t               n_pos,
+        struct ggml_tensor   * t_inp_embd,
+        struct ggml_tensor   * t_h_pre_norm) {
+    if (n_tokens == 0 || positions == nullptr || t_inp_embd == nullptr || t_h_pre_norm == nullptr) {
         return;
     }
-    if (t->ne[1] != (int64_t) n_tokens) {
+    if (t_h_pre_norm->ne[1] != (int64_t) n_tokens || t_inp_embd->ne[1] != (int64_t) n_tokens) {
         return;
     }
     const int64_t n_embd = model.hparams.n_embd;
-    GGML_ASSERT(t->ne[0] == n_embd);
+    GGML_ASSERT(t_h_pre_norm->ne[0] == n_embd);
+    GGML_ASSERT(t_inp_embd->ne[0] == n_embd);
+    GGML_ASSERT(n_pos > 0);
 
-    const int       n_rows    = (int) n_tokens;
-    const llama_pos pos_start = positions[0];
+    const int  n_rows     = (int) n_tokens;
+    const bool has_tokens = tokens != nullptr;
+    const bool has_mrope  = n_pos > 1;
+    const bool token_mode  = has_tokens;
 
+    const llama_pos pos_start_0 = positions[0];
     const llama_pos pos_max_mtp = llama_memory_seq_pos_max(llama_get_memory(mtp.ctx_mtp), 0);
-    if (pos_start <= pos_max_mtp) {
+    if (token_mode && pos_start_0 <= pos_max_mtp) {
         return;
     }
 
-    const bool pending_continues = mtp.pending_pos >= 0 && mtp.pending_pos + 1 == pos_start;
+    const bool pending_continues = mtp.pending_pos >= 0 && (
+            token_mode
+                ? mtp.pending_pos <  pos_start_0
+                : true);
     if (mtp.pending_pos >= 0 && !pending_continues) {
         mtp.pending_pos = -1;
     }
 
     synchronize();
 
-    const size_t row_bytes = (size_t) n_embd * sizeof(float);
-    const int    n_out     = (pending_continues ? 1 : 0) + (n_rows - 1);
+    const size_t row_bytes        = (size_t) n_embd * sizeof(float);
+
+    auto logical_pos_last = [&]() {
+        if (!has_tokens && has_mrope) {
+            // M-RoPE image batches use a constant temporal lane and advance
+            // the logical sequence by max(nx, ny). The helper lays positions
+            // out lane-major: [t...][y...][x...][z...]. Derive the logical
+            // end from the advanced lanes instead of using the final row's
+            // temporal value, which is constant for Qwen-VL image spans.
+            llama_pos p = positions[0];
+            for (uint32_t lane = 0; lane < n_pos; ++lane) {
+                for (int row = 0; row < n_rows; ++row) {
+                    p = std::max(p, positions[(size_t) lane * n_rows + row]);
+                }
+            }
+            return p;
+        }
+
+        return positions[n_rows - 1];
+    };
+
+    const int    n_out            = (pending_continues ? 1 : 0) + (n_rows - 1);
+
+    auto copy_pos = [&](int out_idx, int src_row, int out_count) {
+        if (token_mode) {
+            mtp.hook_batch.pos[out_idx] = positions[src_row];
+            return;
+        }
+
+        for (uint32_t lane = 0; lane < n_pos; ++lane) {
+            mtp.hook_batch.pos[(size_t) lane * out_count + out_idx] =
+                positions[(size_t) lane * n_rows + src_row];
+        }
+    };
+
+    auto prepare_row = [&](int out_idx, int src_row, const float * h_row_host) {
+        // llama_batch carries embeddings as a dense flat matrix with no stride
+        // metadata. Token mode feeds only h_i into the MTP graph, so rows must
+        // be packed at n_embd stride. Embedding/media mode feeds [e_i ; h_i],
+        // so rows must be packed at 2*n_embd stride.
+        const size_t row_stride = (size_t) (token_mode ? n_embd : 2*n_embd);
+        float * base = mtp.hook_batch.embd + (size_t) out_idx * row_stride;
+
+        if (!token_mode) {
+            ggml_backend_tensor_get(t_inp_embd,
+                    base,
+                    (size_t) src_row * row_bytes,
+                    row_bytes);
+        }
+
+        float * h_dst = token_mode ? base : base + n_embd;
+        if (h_row_host) {
+            std::memcpy(h_dst, h_row_host, row_bytes);
+        } else {
+            ggml_backend_tensor_get(t_h_pre_norm,
+                    h_dst,
+                    (size_t) (src_row - 1) * row_bytes,
+                    row_bytes);
+        }
+    };
 
     if (n_out > 0) {
         int out_idx = 0;
+        mtp.hook_batch.token = token_mode ? mtp.hook_token : nullptr;
+
         if (pending_continues) {
-            std::memcpy(mtp.hook_batch.embd + (size_t) out_idx * n_embd,
-                        mtp.pending_h.data(), row_bytes);
-            mtp.hook_batch.token[out_idx]     = tokens[0];
-            mtp.hook_batch.pos[out_idx]       = pos_start;
+            prepare_row(out_idx, 0, mtp.pending_h.data());
+            if (token_mode) {
+                mtp.hook_batch.token[out_idx] = has_tokens ? tokens[0] : 0;
+            }
+            copy_pos(out_idx, 0, n_out);
             mtp.hook_batch.n_seq_id[out_idx]  = 1;
             mtp.hook_batch.seq_id[out_idx][0] = 0;
             mtp.hook_batch.logits[out_idx]    = 0;
             ++out_idx;
         }
         for (int k = 0; k + 1 < n_rows; ++k) {
-            ggml_backend_tensor_get(t,
-                mtp.hook_batch.embd + (size_t) out_idx * n_embd,
-                (size_t) k * row_bytes,
-                row_bytes);
-            mtp.hook_batch.token[out_idx]     = tokens[k + 1];
-            mtp.hook_batch.pos[out_idx]       = positions[k + 1];
+            const int src_row = k + 1;
+            prepare_row(out_idx, src_row, nullptr);
+            if (token_mode) {
+                mtp.hook_batch.token[out_idx] = has_tokens ? tokens[src_row] : 0;
+            }
+            copy_pos(out_idx, src_row, n_out);
             mtp.hook_batch.n_seq_id[out_idx]  = 1;
             mtp.hook_batch.seq_id[out_idx][0] = 0;
             mtp.hook_batch.logits[out_idx]    = 0;
@@ -3462,17 +3561,18 @@ void llama_context::handle_mtp_for_ubatch(
         mtp.hook_batch.n_tokens = n_out;
 
         const int32_t rc_dec = llama_decode(mtp.ctx_mtp, mtp.hook_batch);
+        mtp.hook_batch.token = mtp.hook_token;
         if (rc_dec != 0) {
             LLAMA_LOG_ERROR("%s: llama_decode(ctx_mtp) failed rc=%d (pos=%d, n=%d)\n",
-                            __func__, (int) rc_dec, (int) pos_start, n_out);
+                            __func__, (int) rc_dec, (int) pos_start_0, n_out);
         }
     }
 
     // Stash the last h-row as the new pending (for the next ubatch's first
     // token to pair with).
-    ggml_backend_tensor_get(t, mtp.pending_h.data(),
+    ggml_backend_tensor_get(t_h_pre_norm, mtp.pending_h.data(),
         (size_t) (n_rows - 1) * row_bytes, row_bytes);
-    mtp.pending_pos = pos_start + n_rows - 1;
+    mtp.pending_pos = logical_pos_last();
 }
 
 void llama_synchronize(llama_context * ctx) {
@@ -3644,6 +3744,7 @@ bool llama_context_seq_rm(
 
     if (llama_context * ctx_mtp = ctx->get_mtp()) {
         llama_memory_seq_rm(llama_get_memory(ctx_mtp), 0, p0, p1);
+        ctx->mtp_reset_pending_after(p0);
     }
     return ok;
 }

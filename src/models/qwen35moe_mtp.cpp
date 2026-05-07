@@ -96,20 +96,41 @@ llama_model_qwen35moe_mtp::graph::graph(const llama_model & model, const llm_gra
     int sections[4];
     std::copy(std::begin(hparams.rope_sections), std::begin(hparams.rope_sections) + 4, sections);
 
-    auto inp = std::make_unique<llm_graph_input_embd>(hparams.n_embd);
+    auto inp = std::make_unique<llm_graph_input_embd>(ubatch.token ? hparams.n_embd : 2 * hparams.n_embd);
 
     inp->tokens = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
     ggml_set_input(inp->tokens);
 
-    inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams.n_embd, n_tokens);
+    inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, ubatch.token ? hparams.n_embd : 2 * hparams.n_embd, n_tokens);
     ggml_set_input(inp->embd);
-    ggml_set_name(inp->embd, "mtp_h_input");
+    ggml_set_name(inp->embd, ubatch.token ? "mtp_h_input" : "mtp_eh_input");
 
     ggml_tensor * tok_embd_w = layer.nextn.embed_tokens ? layer.nextn.embed_tokens : model.tok_embd;
 
-    ggml_tensor * h_input  = inp->embd;
+    ggml_tensor * e_from_embd = nullptr;
+    ggml_tensor * h_input     = nullptr;
+
+    if (ubatch.token) {
+        h_input = inp->embd;
+        cb(h_input, "mtp_h_input", il);
+    } else {
+        e_from_embd = ggml_view_2d(ctx0, inp->embd,
+                hparams.n_embd, n_tokens,
+                inp->embd->nb[1],
+                0);
+        cb(e_from_embd, "mtp_e_input", il);
+
+        h_input = ggml_view_2d(ctx0, inp->embd,
+                hparams.n_embd, n_tokens,
+                inp->embd->nb[1],
+                hparams.n_embd * ggml_element_size(inp->embd));
+        cb(h_input, "mtp_h_input", il);
+    }
+
     ggml_tensor * tok_embd = ggml_get_rows(ctx0, tok_embd_w, inp->tokens);
     cb(tok_embd, "mtp_tok_embd", il);
+
+    ggml_tensor * e_input = ubatch.token ? tok_embd : e_from_embd;
 
     res->add_input(std::move(inp));
 
@@ -119,7 +140,7 @@ llama_model_qwen35moe_mtp::graph::graph(const llama_model & model, const llm_gra
     ggml_tensor * h_norm = build_norm(h_input, layer.nextn.hnorm, nullptr, LLM_NORM_RMS, il);
     cb(h_norm, "mtp_hnorm", il);
 
-    ggml_tensor * e_norm = build_norm(tok_embd, layer.nextn.enorm, nullptr, LLM_NORM_RMS, il);
+    ggml_tensor * e_norm = build_norm(e_input, layer.nextn.enorm, nullptr, LLM_NORM_RMS, il);
     cb(e_norm, "mtp_enorm", il);
 
     ggml_tensor * concat = ggml_concat(ctx0, e_norm, h_norm, /*dim=*/ 0);

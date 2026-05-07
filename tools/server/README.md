@@ -250,7 +250,7 @@ For the full list of features, please refer to [server's changelog](https://gith
 | `--spec-draft-model, -md, --model-draft FNAME` | draft model for speculative decoding (default: unused)<br/>(env: LLAMA_ARG_SPEC_DRAFT_MODEL) |
 | `--spec-draft-replace, --spec-replace TARGET DRAFT` | translate the string in TARGET into DRAFT if the draft model and main model are not compatible |
 | `--spec-type [none\|mtp\|ngram-cache\|ngram-simple\|ngram-map-k\|ngram-map-k4v\|ngram-mod]` | type of speculative decoding to use when no draft model is provided (default: none)<br/><br/>(env: LLAMA_ARG_SPEC_TYPE) |
-| `--spec-mtmd, --spec-multimodal` | request speculative decoding for multimodal requests (experimental; currently logs and falls back to non-speculative multimodal decoding)<br/>(env: LLAMA_ARG_SPEC_MTMD) |
+| `--spec-mtmd, --spec-multimodal` | request speculative decoding for multimodal requests (experimental; mirrors multimodal prefill into the MTP context, then enables drafting for generated text)<br/>(env: LLAMA_ARG_SPEC_MTMD) |
 | `--spec-ngram-mod-n-min N` | minimum number of ngram tokens to use for ngram-based speculative decoding (default: 48) |
 | `--spec-ngram-mod-n-max N` | maximum number of ngram tokens to use for ngram-based speculative decoding (default: 64) |
 | `--spec-ngram-mod-n-match N` | ngram-mod lookup length (default: 24) |
