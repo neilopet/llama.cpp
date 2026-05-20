@@ -3554,6 +3554,17 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_N_CPU_MOE"));
 
     add_opt(common_arg(
+        {"--spec-draft-ctx-size", "-cd", "--ctx-size-draft"}, "N",
+        "compatibility no-op for older local presets; upstream draft contexts now derive their context sizing from the active target/draft configuration",
+        [](common_params & /*params*/, int /*value*/) {
+            // Intentionally accepted and ignored. BOSGAME/Z13 router presets
+            // produced before upstream's backend-sampled MTP refactor include
+            // ctx-size-draft. Rejecting the key prevents otherwise-compatible
+            // presets from loading. Keep this until local presets are migrated.
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_CTX_SIZE"));
+
+    add_opt(common_arg(
         {"--spec-draft-n-max"}, "N",
         string_format("number of tokens to draft for speculative decoding (default: %d)", params.speculative.draft.n_max),
         [](common_params & params, int value) {
@@ -3636,6 +3647,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.speculative.types.insert(params.speculative.types.end(), types.begin(), types.end());
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_TYPE"));
+    add_opt(common_arg(
+        {"--spec-mtmd", "--spec-multimodal"},
+        "compatibility flag for older local presets; multimodal prompt mirroring is handled by the upstream draft context path when available",
+        [](common_params & /*params*/) {
+            // Intentionally accepted and ignored. Older local Qwen MTP presets
+            // used this opt-in flag while the local branch was experimenting
+            // with multimodal prefill mirroring. Upstream's current server path
+            // handles draft-context multimodal prompt processing directly.
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SPEC_MTMD"));
     add_opt(common_arg(
         {"--spec-ngram-mod-n-min"}, "N",
         string_format("minimum number of ngram tokens to use for ngram-based speculative decoding (default: %d)", params.speculative.ngram_mod.n_min),
