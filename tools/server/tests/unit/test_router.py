@@ -22,6 +22,30 @@ def test_router_props():
     assert res.body["build_info"].startswith("b")
 
 
+def test_router_health_reports_loaded_children():
+    global server
+    server.no_models_autoload = True
+    server.start()
+
+    idle = server.make_request("GET", "/health")
+    assert idle.status_code == 200
+    assert idle.body["status"] == "ok"
+    assert idle.body["role"] == "router"
+
+    model_id = "ggml-org/tinygemma3-GGUF:Q8_0"
+    _load_model_and_wait(model_id)
+
+    loaded = server.make_request("GET", "/health")
+    assert loaded.status_code == 200
+    model_health = {
+        item["id"]: item
+        for item in loaded.body["models"]
+    }
+    assert model_health[model_id]["status"] == "loaded"
+    assert model_health[model_id]["child_health_check"] is True
+    assert model_health[model_id]["healthy"] is True
+
+
 @pytest.mark.parametrize(
     "model,success",
     [

@@ -1150,7 +1150,96 @@ static bool is_autoload(const common_params & params, const server_http_req & re
     }
 }
 
+static bool router_model_loads_on_startup(const server_model_meta & meta) {
+    std::string val;
+    return meta.preset.get_option(COMMON_ARG_PRESET_LOAD_ON_STARTUP, val) && common_arg_utils::is_truthy(val);
+}
+
+static bool router_check_child_health(const server_model_meta & meta, json & health) {
+    health["port"] = meta.port;
+
+    if (meta.port <= 0) {
+        health["healthy"] = false;
+        health["reason"]  = "missing child port";
+        return false;
+    }
+
+    httplib::Client cli(CHILD_ADDR, meta.port);
+    cli.set_connection_timeout(1, 0);
+    cli.set_write_timeout(1, 0);
+    cli.set_read_timeout(1, 0);
+
+    auto result = cli.Get("/health");
+    if (!result) {
+        health["healthy"] = false;
+        health["reason"]  = "child health request failed: " + httplib::to_string(result.error());
+        return false;
+    }
+    if (result->status < 200 || result->status >= 300) {
+        health["healthy"] = false;
+        health["reason"]  = string_format("child health returned HTTP %d", result->status);
+        return false;
+    }
+
+    health["healthy"] = true;
+    return true;
+}
+
 void server_models_routes::init_routes() {
+    this->get_router_health = [this](const server_http_req &) {
+        auto res = std::make_unique<server_http_res>();
+
+        json models_json = json::array();
+        bool healthy = true;
+
+        auto all_models = models.get_all_meta();
+        for (const auto & meta : all_models) {
+            const bool required = router_model_loads_on_startup(meta);
+            const bool running  = meta.is_running();
+
+            json model_health {
+                {"id",                meta.name},
+                {"status",            server_model_status_to_string(meta.status)},
+                {"required",          required},
+                {"running",           running},
+                {"exit_code",         meta.exit_code},
+                {"child_health_check", false},
+                {"healthy",           true},
+            };
+
+            if (meta.status == SERVER_MODEL_STATUS_LOADING) {
+                model_health["healthy"] = false;
+                model_health["reason"]  = "model is still loading";
+                healthy = false;
+            } else if (required && meta.status != SERVER_MODEL_STATUS_LOADED && meta.status != SERVER_MODEL_STATUS_SLEEPING) {
+                model_health["healthy"] = false;
+                model_health["reason"]  = meta.is_failed()
+                    ? "required model process exited"
+                    : "required startup model is not loaded";
+                healthy = false;
+            } else if (meta.status == SERVER_MODEL_STATUS_LOADED || meta.status == SERVER_MODEL_STATUS_SLEEPING) {
+                model_health["child_health_check"] = true;
+                if (!router_check_child_health(meta, model_health)) {
+                    healthy = false;
+                }
+            } else if (meta.is_failed() && required) {
+                model_health["healthy"] = false;
+                model_health["reason"]  = "required model failed";
+                healthy = false;
+            }
+
+            models_json.push_back(model_health);
+        }
+
+        res->status = healthy ? 200 : 503;
+        res->data = safe_json_to_str({
+            {"status", healthy ? "ok" : "error"},
+            {"role", "router"},
+            {"models", models_json},
+        });
+        return res;
+    };
+
     this->get_router_props = [this](const server_http_req & req) {
         std::string name = req.get_param("model");
         if (name.empty()) {
