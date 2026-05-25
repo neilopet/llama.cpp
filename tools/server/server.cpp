@@ -166,6 +166,7 @@ int llama_server(int argc, char ** argv) {
         routes.post_slots                  = models_routes->proxy_post;
 
         // custom routes for router
+        routes.get_health                  = models_routes->get_router_health;
         routes.get_props                   = models_routes->get_router_props;
         routes.get_models                  = models_routes->get_router_models;
 
