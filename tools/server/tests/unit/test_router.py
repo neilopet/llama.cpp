@@ -7,6 +7,7 @@ server: ServerProcess
 def create_server():
     global server
     server = ServerPreset.router()
+    server.server_port = 18080
 
 
 def test_router_props():
@@ -33,6 +34,9 @@ def test_router_health_reports_loaded_children():
     assert idle.body["role"] == "router"
 
     model_id = "ggml-org/tinygemma3-GGUF:Q8_0"
+    if model_id not in _get_model_ids(is_reload=False):
+        pytest.skip(f"{model_id} is not available in the local router test cache")
+
     _load_model_and_wait(model_id)
 
     loaded = server.make_request("GET", "/health")
