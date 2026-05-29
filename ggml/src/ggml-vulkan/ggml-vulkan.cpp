@@ -8091,7 +8091,7 @@ static void ggml_vk_buffer_copy(vk_buffer& dst, size_t dst_offset, vk_buffer& sr
 
                 // Single-shot cross-device copy via staging
                 ggml_vk_buffer_copy(src->device->sync_staging, 0, src, src_offset, size);
-                ggml_vk_buffer_write_2d(dst, dst_offset, src->device->sync_staging->ptr, 0, size, 1);
+                ggml_vk_buffer_write_2d(dst, dst_offset, src->device->sync_staging->ptr, size, size, size, 1);
                 return;
             } catch (const vk::OutOfDeviceMemoryError&) {
                 std::lock_guard<std::recursive_mutex> guard(src->device->mutex);
@@ -8120,7 +8120,7 @@ static void ggml_vk_buffer_copy(vk_buffer& dst, size_t dst_offset, vk_buffer& sr
             const size_t chunk = std::min(remaining, src->device->sync_staging->size);
 
             ggml_vk_buffer_copy(src->device->sync_staging, 0, src, s_off, chunk);
-            ggml_vk_buffer_write_2d(dst, d_off, src->device->sync_staging->ptr, 0, chunk, 1);
+            ggml_vk_buffer_write_2d(dst, d_off, src->device->sync_staging->ptr, chunk, chunk, chunk, 1);
 
             s_off += chunk;
             d_off += chunk;
