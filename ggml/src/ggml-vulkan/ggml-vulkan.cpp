@@ -7771,7 +7771,7 @@ static void ggml_vk_buffer_write_2d(vk_buffer& dst, size_t offset, const void * 
                 // Single-shot transfer
                 vk_context subctx = ggml_vk_create_temporary_context(dst->device->transfer_queue.cmd_pool);
                 ggml_vk_ctx_begin(dst->device, subctx);
-                bool ret = ggml_vk_buffer_write_2d_async(subctx, dst, offset, src, 0, width, 1, true);
+                bool ret = ggml_vk_buffer_write_2d_async(subctx, dst, offset, src, width, width, width, 1, true);
                 GGML_ASSERT(ret);
                 ggml_vk_ctx_end(subctx);
 
@@ -7813,7 +7813,7 @@ static void ggml_vk_buffer_write_2d(vk_buffer& dst, size_t offset, const void * 
             const size_t chunk = std::min(remaining, dst->device->sync_staging->size);
 
             ggml_vk_ctx_begin(dst->device, subctx);
-            bool ret = ggml_vk_buffer_write_2d_async(subctx, dst, dst_off, src_ptr, 0, chunk, 1, true);
+            bool ret = ggml_vk_buffer_write_2d_async(subctx, dst, dst_off, src_ptr, chunk, chunk, chunk, 1, true);
             GGML_ASSERT(ret);
             ggml_vk_ctx_end(subctx);
 
