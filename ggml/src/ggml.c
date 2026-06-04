@@ -5223,7 +5223,7 @@ static struct ggml_tensor * ggml_fill_impl(
     struct ggml_tensor  * a,
     float                 c,
     bool                  inplace) {
-    GGML_ASSERT(a->type == GGML_TYPE_F32);
+    GGML_ASSERT(a->type == GGML_TYPE_F32 || a->type == GGML_TYPE_F16);
     GGML_ASSERT(ggml_is_contiguous(a));
 
     struct ggml_tensor * result = inplace ? ggml_view_tensor(ctx, a) : ggml_dup_tensor(ctx, a);
@@ -6186,8 +6186,7 @@ struct ggml_tensor * ggml_gated_delta_net(
         struct ggml_tensor  * v,
         struct ggml_tensor  * g,
         struct ggml_tensor  * beta,
-        struct ggml_tensor  * state,
-        bool                  keep_intermediates) {
+        struct ggml_tensor  * state) {
     GGML_ASSERT(ggml_is_contiguous_rows(q));
     GGML_ASSERT(ggml_is_contiguous_rows(k));
     GGML_ASSERT(ggml_is_contiguous_rows(v));
@@ -6211,9 +6210,12 @@ struct ggml_tensor * ggml_gated_delta_net(
     GGML_ASSERT(g->ne[0] == 1 || g->ne[0] == S_v);
     GGML_ASSERT(beta->ne[0] == 1);
 
-    GGML_ASSERT(ggml_nelements(state) == S_v * S_v * H * n_seqs);
-
-    const int64_t state_rows = keep_intermediates ? n_tokens * S_v * n_seqs : S_v * n_seqs;
+    // state is a 3D tensor (S_v*S_v*H, K, n_seqs). K is the snapshot slot count.
+    GGML_ASSERT(state->ne[0] == S_v * S_v * H);
+    GGML_ASSERT(state->ne[2] == n_seqs);
+    GGML_ASSERT(state->ne[3] == 1);
+    const int64_t K = state->ne[1];
+    const int64_t state_rows = K * S_v * n_seqs;
     const int64_t ne[4] = { S_v * H, n_tokens * n_seqs + state_rows, 1, 1 };
     struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
 
@@ -6224,9 +6226,6 @@ struct ggml_tensor * ggml_gated_delta_net(
     result->src[3] = g;
     result->src[4] = beta;
     result->src[5] = state;
-
-    int32_t flag = keep_intermediates ? 1 : 0;
-    ggml_set_op_params(result, &flag, sizeof(flag));
 
     return result;
 }
