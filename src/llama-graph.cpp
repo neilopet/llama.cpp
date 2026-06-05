@@ -1863,10 +1863,14 @@ ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd) const {
 
     res->t_inp_embd = cur;
 
-    // For Granite architecture
-    // NOTE: Only apply scale to token inputs. Raw embeddings are assumed to be
-    //  multimodal inputs that should not be scaled.
-    if (ubatch.token && hparams.f_embedding_scale != 0.0f) {
+    // For Granite architecture.
+    // Upstream Granite4 Vision intentionally skips scaling for raw deepstack
+    // vision embeddings. Granite Speech audio embeddings are also raw
+    // embeddings, but they still require f_embedding_scale; skipping the scale
+    // regresses ASR into short/foreign-language garbage.
+    const bool granite4_vision_raw_embd =
+        arch == LLM_ARCH_GRANITE && !ubatch.token && hparams.n_deepstack_layers > 0;
+    if (!granite4_vision_raw_embd && hparams.f_embedding_scale != 0.0f) {
         if (!ggml_is_contiguous(cur)) {
             cur = ggml_cont(ctx0, cur);
         }
