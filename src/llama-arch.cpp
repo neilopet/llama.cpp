@@ -833,6 +833,14 @@ const char * llm_arch_name(llm_arch arch) {
 }
 
 llm_arch llm_arch_from_string(const std::string & name) {
+    // Some Gemma 4 MTP assistant-head GGUFs were published with an underscore
+    // architecture name while llama.cpp standardizes the architecture key with
+    // a hyphen. Treat the underscore variant as an input alias, but keep the
+    // canonical emitted name unchanged.
+    if (name == "gemma4_assistant") {
+        return LLM_ARCH_GEMMA4_ASSISTANT;
+    }
+
     for (const auto & kv : LLM_ARCH_NAMES) { // NOLINT
         if (kv.second == name) {
             return kv.first;
