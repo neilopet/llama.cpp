@@ -777,6 +777,7 @@ struct llm_graph_qkv {
 
 struct llm_graph_context {
     const llm_arch arch;
+    const llm_graph_type gtype;
 
     const llama_hparams & hparams;
     const llama_cparams & cparams;
