@@ -888,6 +888,22 @@ const llama_model_loader::llama_tensor_weight * llama_model_loader::get_weight(c
         return &pos->second;
     }
 
+    if (llm_kv.arch == LLM_ARCH_GEMMA4_ASSISTANT) {
+        const std::string requested(name);
+        static constexpr const char * nextn_prefix = "nextn.";
+        static constexpr const char * mtp_prefix   = "mtp.";
+
+        // Some published Gemma 4 assistant-head GGUFs use mtp.* names for
+        // the model-level projection tensors that llama.cpp names nextn.*.
+        if (requested.rfind(nextn_prefix, 0) == 0) {
+            const std::string alias = std::string(mtp_prefix) + requested.substr(std::strlen(nextn_prefix));
+            auto alias_pos = weights_map.find(alias);
+            if (alias_pos != weights_map.end()) {
+                return &alias_pos->second;
+            }
+        }
+    }
+
     return nullptr;
 }
 
