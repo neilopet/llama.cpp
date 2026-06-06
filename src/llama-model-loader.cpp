@@ -17,6 +17,46 @@ static const size_t kiB = 1024;
 static const size_t MiB = 1024*kiB;
 static const size_t GiB = 1024*MiB;
 
+static std::string llama_model_loader_kv_alias(const std::string & arch_name, const std::string & key) {
+    static constexpr const char * canonical = "gemma4-assistant.";
+    static constexpr const char * published = "gemma4_assistant.";
+
+    // Some Gemma 4 MTP assistant-head GGUFs were published with
+    // general.architecture=gemma4_assistant and matching underscore-prefixed
+    // metadata keys. llama.cpp's canonical architecture name uses a hyphen.
+    // Keep the canonical architecture stable while accepting the published
+    // input key prefix when loading those GGUFs.
+    if (arch_name == "gemma4_assistant" && key.rfind(canonical, 0) == 0) {
+        return std::string(published) + key.substr(std::strlen(canonical));
+    }
+
+    return key;
+}
+
+static int llama_model_loader_find_key(
+        const gguf_context * ctx,
+        const std::string & arch_name,
+        const std::string & key,
+        std::string * actual_key = nullptr) {
+    int kid = gguf_find_key(ctx, key.c_str());
+    if (kid >= 0) {
+        if (actual_key) {
+            *actual_key = key;
+        }
+        return kid;
+    }
+
+    const std::string alias = llama_model_loader_kv_alias(arch_name, key);
+    if (alias != key) {
+        kid = gguf_find_key(ctx, alias.c_str());
+        if (kid >= 0 && actual_key) {
+            *actual_key = alias;
+        }
+    }
+
+    return kid;
+}
+
 const char * llama_file_version_name(llama_fver version) {
     switch (version) {
         case GGUF_FILE_VERSION_V1: return "GGUF V1 (support until nov 2023)";
@@ -270,7 +310,8 @@ namespace GGUFMeta {
     template<typename T>
     typename std::enable_if<std::is_integral<T>::value, bool>::type
     llama_model_loader::get_arr_n(const std::string & key, T & result, bool required) {
-        const int kid = gguf_find_key(metadata, key.c_str());
+        std::string actual_key;
+        const int kid = llama_model_loader_find_key(metadata, arch_name, key, &actual_key);
 
         if (kid < 0) {
             if (required) {
@@ -298,7 +339,8 @@ namespace GGUFMeta {
     template<typename T>
     bool llama_model_loader::get_arr(const std::string & key, std::vector<T> & result, bool required) {
         const gguf_context * ctx = metadata;
-        const int kid = gguf_find_key(ctx, key.c_str());
+        std::string actual_key;
+        const int kid = llama_model_loader_find_key(ctx, arch_name, key, &actual_key);
 
         if (kid < 0 || gguf_get_kv_type(ctx, kid) != GGUF_TYPE_ARRAY) {
             if (required) {
@@ -339,7 +381,8 @@ namespace GGUFMeta {
     template<typename T, size_t N_MAX>
     bool llama_model_loader::get_arr(const std::string & key, std::array<T, N_MAX> & result, bool required) {
         const gguf_context * ctx = metadata;
-        const int kid = gguf_find_key(ctx, key.c_str());
+        std::string actual_key;
+        const int kid = llama_model_loader_find_key(ctx, arch_name, key, &actual_key);
 
         if (kid < 0 || gguf_get_kv_type(ctx, kid) != GGUF_TYPE_ARRAY) {
             if (required) {
@@ -402,7 +445,17 @@ namespace GGUFMeta {
         const struct llama_model_kv_override * override =
             it != kv_overrides.end() ? &it->second : nullptr;
 
-        const bool found = GGUFMeta::GKV<T>::set(metadata, key, result, override);
+        bool found = GGUFMeta::GKV<T>::set(metadata, key, result, override);
+
+        if (!found) {
+            const std::string alias = llama_model_loader_kv_alias(arch_name, key);
+            if (alias != key) {
+                auto alias_it = kv_overrides.find(alias);
+                const struct llama_model_kv_override * alias_override =
+                    alias_it != kv_overrides.end() ? &alias_it->second : override;
+                found = GGUFMeta::GKV<T>::set(metadata, alias, result, alias_override);
+            }
+        }
 
         if (required && !found) {
             throw std::runtime_error(format("key not found in model: %s", key.c_str()));
@@ -436,7 +489,8 @@ namespace GGUFMeta {
     // get array of n <= N_MAX elements, or a single element repeated n times
     template<typename T, size_t N_MAX>
     bool llama_model_loader::get_key_or_arr(const std::string & key, std::array<T, N_MAX> & result, uint32_t n, bool required) {
-        const int kid = gguf_find_key(metadata, key.c_str());
+        std::string actual_key;
+        const int kid = llama_model_loader_find_key(metadata, arch_name, key, &actual_key);
 
         if (kid < 0) {
             if (required) {
@@ -457,12 +511,12 @@ namespace GGUFMeta {
                 throw std::runtime_error(format("key %s has wrong array length; expected %u, got %u", key.c_str(), n, (uint32_t) arr_info.length));
             }
 
-            return get_arr(key, result, required);
+            return get_arr(actual_key, result, required);
         }
 
         T value;
 
-        bool ok = get_key(key, value, required);
+        bool ok = get_key(actual_key, value, required);
         if (!ok) {
             return false;
         }
@@ -482,7 +536,8 @@ namespace GGUFMeta {
     bool llama_model_loader::get_key_or_arr(enum llm_kv kid, uint32_t & result, bool required) {
         const std::string key = llm_kv(kid);
 
-        const int id = gguf_find_key(metadata, key.c_str());
+        std::string actual_key;
+        const int id = llama_model_loader_find_key(metadata, arch_name, key, &actual_key);
 
         if (id < 0) {
             if (required) {
@@ -499,7 +554,7 @@ namespace GGUFMeta {
             return false;
         }
 
-        return get_key(key, result, required);
+        return get_key(actual_key, result, required);
     }
 
     // TODO: this is not very clever - figure out something better
