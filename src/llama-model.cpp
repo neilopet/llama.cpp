@@ -1042,6 +1042,13 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_CONTEXT_LENGTH,          hparams.n_ctx_train);
     ml.get_key(LLM_KV_EMBEDDING_LENGTH,        hparams.n_embd);
     ml.get_key(LLM_KV_EMBEDDING_LENGTH_OUT,    hparams.n_embd_out_impl, false);
+    if (ml.get_arch() == LLM_ARCH_GEMMA4_ASSISTANT && hparams.n_embd_out_impl == 0 && ml.get_arch_name() == "gemma4_assistant") {
+        // Some published Gemma 4 MTP assistant heads use the underscore
+        // architecture/key namespace and omit embedding_length_out, but carry
+        // the target/backbone hidden size in embedding_length_per_layer_input.
+        // The Gemma 4 assistant graph needs this as n_embd_out().
+        ml.get_key(LLM_KV_EMBEDDING_LENGTH_PER_LAYER, hparams.n_embd_out_impl, false);
+    }
     ml.get_key(LLM_KV_ATTENTION_CAUSAL,        hparams.causal_attn,     false);
     ml.get_key(LLM_KV_POOLING_TYPE,            hparams.pooling_type,    false);
     ml.get_key(LLM_KV_BLOCK_COUNT,             hparams.n_layer_all);
