@@ -438,7 +438,15 @@ void llama_context::sched_reserve() {
     const int64_t t_start_us = ggml_time_us();
 
     const uint32_t n_seqs = cparams.n_seq_max;
-    const uint32_t n_tokens = std::min(cparams.n_ctx, cparams.n_ubatch);
+
+    // MTP contexts do not perform prompt processing. The draft head is called
+    // with at most one token per active slot, plus the target hidden-state row
+    // for that token. Reserving a normal prompt-processing graph here can make
+    // the Gemma 4 assistant build an attention graph shape that is never used
+    // at runtime and can trip flash-attention shape assertions when
+    // --parallel > 1.
+    const bool is_mtp_context = cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP;
+    const uint32_t n_tokens = is_mtp_context ? n_seqs : std::min(cparams.n_ctx, cparams.n_ubatch);
 
     const size_t max_nodes = this->graph_max_nodes(n_tokens);
 
@@ -505,9 +513,21 @@ void llama_context::sched_reserve() {
     }
 
     if (cparams.auto_fgdn) {
-        LLAMA_LOG_INFO("%s: resolving fused Gated Delta Net support:\n", __func__);
+        if (is_mtp_context) {
+            // MTP draft contexts are decoder-only next-token heads. They do not
+            // use Gated Delta Net, and probing fused-GDN support forces a
+            // synthetic attention graph that is not representative of runtime
+            // MTP decoding. With Gemma 4 assistant heads and --parallel > 1,
+            // that synthetic probe can trip attention shape assertions before
+            // the server starts.
+            cparams.fused_gdn_ar = false;
+            cparams.fused_gdn_ch = false;
+            LLAMA_LOG_INFO("%s: fused Gated Delta Net probe skipped for MTP context\n", __func__);
+        } else {
+            LLAMA_LOG_INFO("%s: resolving fused Gated Delta Net support:\n", __func__);
+        }
 
-        if (cparams.fused_gdn_ar) {
+        if (!is_mtp_context && cparams.fused_gdn_ar) {
             auto * gf = graph_reserve(1, n_seqs, n_outputs, mctx.get(), true);
             if (!gf) {
                 throw std::runtime_error("failed to reserve graph for fused Gated Delta Net check (autoregressive)");
@@ -542,7 +562,7 @@ void llama_context::sched_reserve() {
             }
         }
 
-        if (cparams.fused_gdn_ch) {
+        if (!is_mtp_context && cparams.fused_gdn_ch) {
             // more than one token in the batch per sequence in order to take the chunked path
             // note: n_outputs must match n_tokens for embedding models with mean/rank pooling,
             // because build_pooling creates inp_mean with shape [n_tokens, n_seqs] and multiplies
@@ -790,7 +810,8 @@ bool llama_context::memory_update(bool optimize) {
         }
 
         const uint32_t n_seqs = cparams.n_seq_max;
-        const uint32_t n_tokens = std::min(cparams.n_ctx, cparams.n_ubatch);
+        const uint32_t n_tokens =
+            cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP ? n_seqs : std::min(cparams.n_ctx, cparams.n_ubatch);
 
         const uint32_t n_outputs_max = std::min(n_tokens, cparams.n_outputs_max);
 
